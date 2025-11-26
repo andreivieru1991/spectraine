@@ -1,6 +1,5 @@
-from fastapi import FastAPI, HTTPException, Form, Request, Header
+from fastapi import FastAPI, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import random
@@ -19,32 +18,13 @@ stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 
-# Get Price IDs from environment variables with fallbacks
+# Price IDs from environment variables
 PRICE_IDS = {
     "premium_assessment": os.getenv('STRIPE_PREMIUM_ASSESSMENT_PRICE', 'price_1SVsI4Eg6G72wXg4KD2g7Ol3'),
     "aws_setup": os.getenv('STRIPE_AWS_SETUP_PRICE', 'price_1SVsI4Eg6G72wXg4BG2lzf9y'),
     "health_check": os.getenv('STRIPE_HEALTH_CHECK_PRICE', 'price_1SVsI4Eg6G72wXg4CI4BCLnF')
 }
 
-# Add this check to verify Stripe is configured
-def check_stripe_config():
-    if not stripe.api_key:
-        print("❌ STRIPE_SECRET_KEY is not set in environment variables")
-        return False
-    
-    if stripe.api_key.startswith('sk_live') or stripe.api_key.startswith('sk_test'):
-        print(f"✅ Stripe configured with key: {stripe.api_key[:20]}...")
-        return True
-    else:
-        print("❌ Invalid Stripe secret key format")
-        return False
-
-# Call this function when your app starts
-print("🔧 Checking Stripe configuration...")
-if not check_stripe_config():
-    print("🚨 Stripe is not properly configured. Payment features will not work.")
-else:
-    print("✅ Stripe configuration is valid!")
 # Initialize AWS session
 try:
     aws_session = boto3.Session(
@@ -60,12 +40,10 @@ except Exception as e:
 app = FastAPI(
     title="Spectraine API",
     description="Cloud Threat Detection & Cost Optimization",
-    version="2.1.0"
+    version="2.0.0"
 )
 
 # CORS Configuration
-from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"],
@@ -117,6 +95,30 @@ class QuickScanResponse(BaseModel):
     critical_findings: int
     immediate_risks: List[Dict[str, Any]]
     next_actions: List[str]
+
+# Stripe Configuration Check
+def check_stripe_config():
+    if not stripe.api_key:
+        print("❌ STRIPE_SECRET_KEY is not set in environment variables")
+        return False
+    
+    if stripe.api_key.startswith('sk_live') or stripe.api_key.startswith('sk_test'):
+        print(f"✅ Stripe configured with key: {stripe.api_key[:20]}...")
+        return True
+    else:
+        print("❌ Invalid Stripe secret key format")
+        return False
+
+# Print configuration at startup
+print("🔧 Price IDs Configuration:")
+for service, price_id in PRICE_IDS.items():
+    print(f"   {service}: {price_id}")
+
+print("🔧 Checking Stripe configuration...")
+if not check_stripe_config():
+    print("🚨 Stripe is not properly configured. Payment features will not work.")
+else:
+    print("✅ Stripe configuration is valid!")
 
 # AWS Integration Functions
 def get_aws_client(service_name):
@@ -475,64 +477,30 @@ def generate_cost_recommendations(instances):
         }
     ]
 
-# STRIPE PAYMENT FUNCTIONS
-async def send_service_confirmation(session):
-    """Send confirmation email"""
-    print(f"🎉 PAYMENT CONFIRMED: {session['customer_email']}")
-    print(f"   Service: {session['metadata']['service_type']}")
-    print(f"   Amount: ${session['amount_total'] / 100}")
-    print(f"   Customer: {session['metadata'].get('customer_name', 'N/A')}")
-    print(f"   Company: {session['metadata'].get('company', 'N/A')}")
-    
-    # TODO: Integrate with your email service (SendGrid, AWS SES, etc.)
-
-async def handle_successful_payment(session):
-    """Handle successful payment and trigger service delivery"""
-    try:
-        print(f"💰 PAYMENT CONFIRMED VIA WEBHOOK:")
-        print(f"   Customer: {session.get('customer_email')}")
-        print(f"   Amount: ${session.get('amount_total', 0) / 100}")
-        print(f"   Service: {session.get('metadata', {}).get('service_type')}")
-        
-        # Send confirmation email
-        await send_service_confirmation(session)
-        
-        # Log the successful payment
-        print(f"✅ Service activated for: {session.get('customer_email')}")
-        
-    except Exception as e:
-        print(f"❌ Error handling successful payment: {e}")
-
 # API Routes
 @app.get("/")
 async def root():
     return {
-        "message": "Spectraine API - Cloud Threat Detection & Monetization", 
+        "message": "Spectraine API - Cloud Threat Detection", 
         "status": "running",
-        "version": "2.1.0",
+        "version": "2.0.0",
         "demo_mode": True,
         "aws_connected": aws_session is not None,
         "stripe_connected": stripe.api_key is not None,
         "default_region": "eu-north-1",
-        "premium_services": {
-            "premium_assessment": "$997 - Comprehensive security assessment",
-            "aws_setup_service": "$497 - AWS security baseline setup", 
-            "health_check": "$1,497 - Full cloud health check"
-        },
         "endpoints": {
             "/": "API information",
             "/health": "Health check",
+            "/stripe-test": "Test Stripe configuration",
+            "/debug/config": "Debug configuration",
+            "/test-form": "Test form submission",
             "/instances": "Get EC2 instances with threats",
             "/threat-scan": "Run threat detection scan",
             "/cost-analysis": "Get cost optimization recommendations",
-            "/free-assessment": "Submit free assessment request",
+            "/free-assessment": "Submit assessment request",
             "/premium-assessment": "Start premium assessment ($997)",
             "/aws-setup-service": "AWS security setup ($497)",
             "/health-check-package": "Cloud health check ($1,497)",
-            "/create-checkout-session": "Create Stripe checkout session",
-            "/success": "Payment success page",
-            "/cancel": "Payment cancel page",
-            "/stripe-webhook": "Stripe webhook handler",
             "/dashboard-metrics": "Get real-time dashboard metrics",
             "/quick-scan": "Run instant threat scan",
             "/simulate-fix": "Simulate fixing all issues",
@@ -547,41 +515,88 @@ async def health_check():
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "service": "Spectraine API",
-        "version": "2.1.0",
+        "version": "2.0.0",
         "demo_mode": True,
         "aws_connected": aws_session is not None,
         "stripe_connected": stripe.api_key is not None,
         "default_region": "eu-north-1"
     }
 
-# PAYMENT ENDPOINTS
-@app.post("/create-checkout-session")
-async def create_checkout_session(
-    price_id: str = Form(...),
-    customer_email: str = Form(...),
-    service_type: str = Form(...)
-):
-    """Create a Stripe checkout session"""
+# Debug and Test Endpoints
+@app.get("/stripe-test")
+async def stripe_test():
+    """Test Stripe configuration"""
     try:
-        session = stripe.checkout.Session.create(
-            customer_email=customer_email,
-            payment_method_types=['card'],
-            line_items=[{
-                'price': price_id,
-                'quantity': 1,
-            }],
-            mode='payment',
-            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}',
-            cancel_url='https://spectraine1.onrender.com/cancel',
-            metadata={
-                'service_type': service_type,
-                'customer_email': customer_email
+        # Test if Stripe is configured
+        if not stripe.api_key:
+            return {
+                "status": "error",
+                "message": "Stripe secret key not configured",
+                "stripe_configured": False
             }
-        )
-        return {"checkout_url": session.url}
+        
+        # Test if we can retrieve a price
+        price_id = PRICE_IDS["premium_assessment"]
+        price = stripe.Price.retrieve(price_id)
+        
+        return {
+            "status": "success",
+            "stripe_configured": True,
+            "price_id": price_id,
+            "price_amount": f"${price.unit_amount / 100}",
+            "price_currency": price.currency,
+            "product": price.product
+        }
+    except stripe.error.InvalidRequestError as e:
+        return {
+            "status": "error",
+            "stripe_configured": False,
+            "error": f"Stripe API error: {str(e)}",
+            "price_id": PRICE_IDS["premium_assessment"],
+            "note": "Check if your Price ID is correct in Stripe dashboard"
+        }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return {
+            "status": "error",
+            "stripe_configured": False,
+            "error": str(e),
+            "price_id": PRICE_IDS["premium_assessment"]
+        }
 
+@app.get("/debug/config")
+async def debug_config():
+    """Debug endpoint to check configuration"""
+    return {
+        "aws_configured": aws_session is not None,
+        "stripe_configured": stripe.api_key is not None,
+        "stripe_key_prefix": stripe.api_key[:20] + "..." if stripe.api_key else "None",
+        "price_ids": PRICE_IDS,
+        "environment_variables": {
+            "AWS_ACCESS_KEY_ID_set": bool(os.getenv('AWS_ACCESS_KEY_ID')),
+            "STRIPE_SECRET_KEY_set": bool(os.getenv('STRIPE_SECRET_KEY')),
+            "STRIPE_PUBLISHABLE_KEY_set": bool(os.getenv('STRIPE_PUBLISHABLE_KEY')),
+            "STRIPE_PREMIUM_ASSESSMENT_PRICE_set": bool(os.getenv('STRIPE_PREMIUM_ASSESSMENT_PRICE')),
+        }
+    }
+
+@app.post("/test-form")
+async def test_form(
+    name: str = Form("Test User"),
+    email: str = Form("test@example.com"),
+    company: str = Form("Test Company")
+):
+    """Test endpoint for form submission"""
+    return {
+        "status": "success",
+        "message": "Form received successfully",
+        "data": {
+            "name": name,
+            "email": email,
+            "company": company
+        }
+    }
+
+# Payment Endpoints
 @app.post("/premium-assessment")
 async def premium_assessment(
     name: str = Form(...),
@@ -591,19 +606,36 @@ async def premium_assessment(
     priority_concerns: List[str] = Form([])
 ):
     """Premium assessment with payment - $997"""
-    print(f"💰 PREMIUM ASSESSMENT REQUEST: {name} from {company}")
+    print(f"💰 PREMIUM ASSESSMENT REQUEST RECEIVED:")
+    print(f"   Name: {name}")
+    print(f"   Email: {email}")
+    print(f"   Company: {company}")
+    print(f"   AWS Spend: {aws_spend}")
+    print(f"   Priority Concerns: {priority_concerns}")
     
     try:
+        # Validate Stripe configuration
+        if not stripe.api_key:
+            raise HTTPException(status_code=500, detail="Stripe not configured")
+            
+        # Get price ID
+        price_id = PRICE_IDS.get("premium_assessment")
+        if not price_id or price_id.startswith("price_1ABC"):
+            raise HTTPException(status_code=500, detail=f"Invalid Stripe price ID: {price_id}")
+        
+        print(f"🔄 Creating Stripe checkout session...")
+        
+        # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             customer_email=email,
             payment_method_types=['card'],
             line_items=[{
-                'price': PRICE_IDS["premium_assessment"],
+                'price': price_id,
                 'quantity': 1,
             }],
             mode='payment',
-            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}&service=premium-assessment',
-            cancel_url='https://spectraine1.onrender.com/cancel',
+            success_url='http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}&service=premium-assessment',
+            cancel_url='http://localhost:3000/cancel',
             metadata={
                 'service_type': 'premium_assessment',
                 'customer_name': name,
@@ -613,6 +645,8 @@ async def premium_assessment(
                 'priority_concerns': ','.join(priority_concerns)
             }
         )
+        
+        print(f"✅ Premium assessment Stripe session created: {session.id}")
         
         return {
             "message": "Premium assessment checkout created",
@@ -626,8 +660,13 @@ async def premium_assessment(
                 "3-month cost tracking"
             ]
         }
+        
+    except stripe.error.StripeError as e:
+        print(f"❌ Stripe error in premium assessment: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Payment setup failed: {str(e)}")
+        print(f"❌ Error in premium assessment: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
 
 @app.post("/aws-setup-service")
 async def aws_setup_service(
@@ -637,19 +676,35 @@ async def aws_setup_service(
     current_setup: str = Form("unknown")
 ):
     """AWS setup service with payment - $497"""
-    print(f"🔧 AWS SETUP REQUEST: {name} from {company}")
+    print(f"🔧 AWS SETUP REQUEST RECEIVED:")
+    print(f"   Name: {name}")
+    print(f"   Email: {email}")
+    print(f"   Company: {company}")
+    print(f"   Current Setup: {current_setup}")
     
     try:
+        # Validate Stripe configuration
+        if not stripe.api_key:
+            raise HTTPException(status_code=500, detail="Stripe not configured")
+            
+        # Get price ID
+        price_id = PRICE_IDS.get("aws_setup")
+        if not price_id or price_id.startswith("price_1ABC"):
+            raise HTTPException(status_code=500, detail=f"Invalid Stripe price ID for AWS setup: {price_id}")
+        
+        print(f"🔄 Creating Stripe checkout session for AWS setup...")
+        
+        # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             customer_email=email,
             payment_method_types=['card'],
             line_items=[{
-                'price': PRICE_IDS["aws_setup"],
+                'price': price_id,
                 'quantity': 1,
             }],
             mode='payment',
-            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}&service=aws-setup',
-            cancel_url='https://spectraine1.onrender.com/cancel',
+            success_url='http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}&service=aws-setup',
+            cancel_url='http://localhost:3000/cancel',
             metadata={
                 'service_type': 'aws_setup',
                 'customer_name': name,
@@ -658,6 +713,8 @@ async def aws_setup_service(
                 'current_setup': current_setup
             }
         )
+        
+        print(f"✅ AWS setup Stripe session created: {session.id}")
         
         return {
             "message": "AWS setup service checkout created",
@@ -671,8 +728,13 @@ async def aws_setup_service(
                 "Security baseline configuration"
             ]
         }
+        
+    except stripe.error.StripeError as e:
+        print(f"❌ Stripe error in AWS setup: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Payment setup failed: {str(e)}")
+        print(f"❌ Error in AWS setup service: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
 
 @app.post("/health-check-package")
 async def health_check_package(
@@ -681,17 +743,34 @@ async def health_check_package(
     company: str = Form(...)
 ):
     """Cloud health check package - $1,497"""
+    print(f"🏥 HEALTH CHECK REQUEST RECEIVED:")
+    print(f"   Name: {name}")
+    print(f"   Email: {email}")
+    print(f"   Company: {company}")
+    
     try:
+        # Validate Stripe configuration
+        if not stripe.api_key:
+            raise HTTPException(status_code=500, detail="Stripe not configured")
+            
+        # Get price ID
+        price_id = PRICE_IDS.get("health_check")
+        if not price_id or price_id.startswith("price_1ABC"):
+            raise HTTPException(status_code=500, detail=f"Invalid Stripe price ID for health check: {price_id}")
+        
+        print(f"🔄 Creating Stripe checkout session for health check...")
+        
+        # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             customer_email=email,
             payment_method_types=['card'],
             line_items=[{
-                'price': PRICE_IDS["health_check"],
+                'price': price_id,
                 'quantity': 1,
             }],
             mode='payment',
-            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}&service=health-check',
-            cancel_url='https://spectraine1.onrender.com/cancel',
+            success_url='http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}&service=health-check',
+            cancel_url='http://localhost:3000/cancel',
             metadata={
                 'service_type': 'health_check',
                 'customer_name': name,
@@ -699,6 +778,8 @@ async def health_check_package(
                 'company': company
             }
         )
+        
+        print(f"✅ Health check Stripe session created: {session.id}")
         
         return {
             "message": "Health check package checkout created",
@@ -712,74 +793,15 @@ async def health_check_package(
                 "ROI calculation and tracking"
             ]
         }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Payment setup failed: {str(e)}")
-
-@app.get("/success")
-async def success(session_id: str, service: str = "unknown"):
-    """Payment success page"""
-    try:
-        session = stripe.checkout.Session.retrieve(session_id)
         
-        # Send confirmation
-        await send_service_confirmation(session)
-        
-        return {
-            "message": "Payment successful!",
-            "service": service,
-            "customer_email": session.customer_email,
-            "amount_total": f"${session.amount_total / 100}",
-            "next_steps": [
-                "We'll contact you within 2 hours to schedule your service",
-                "Check your email for confirmation and next steps",
-                "Prepare any AWS access requirements"
-            ]
-        }
+    except stripe.error.StripeError as e:
+        print(f"❌ Stripe error in health check: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        print(f"❌ Error in health check package: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
 
-@app.get("/cancel")
-async def cancel():
-    """Payment cancellation page"""
-    return {
-        "message": "Payment cancelled",
-        "note": "You can try again anytime. No charges were made.",
-        "contact": "If you have questions, contact support@spectraine.com"
-    }
-
-@app.post("/stripe-webhook")
-async def stripe_webhook(request: Request):
-    """Handle Stripe webhooks for payment confirmation"""
-    if not STRIPE_WEBHOOK_SECRET:
-        raise HTTPException(status_code=400, detail="Webhook secret not configured")
-    
-    payload = await request.body()
-    sig_header = request.headers.get('stripe-signature')
-    
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
-    except ValueError as e:
-        # Invalid payload
-        raise HTTPException(status_code=400, detail="Invalid payload")
-    except stripe.error.SignatureVerificationError as e:
-        # Invalid signature
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    
-    # Handle the event
-    if event['type'] == 'checkout.session.completed':
-        session = event['data']['object']
-        await handle_successful_payment(session)
-    elif event['type'] == 'payment_intent.succeeded':
-        payment_intent = event['data']['object']
-        print(f"Payment succeeded: {payment_intent['id']}")
-    else:
-        print(f"Unhandled event type: {event['type']}")
-    
-    return {"status": "success"}
-
-# EXISTING APPLICATION ENDPOINTS
+# Existing Application Endpoints
 @app.get("/instances", response_model=List[InstanceResponse])
 async def get_instances(use_real: bool = False):
     """Get EC2 instances with threat analysis"""
@@ -1054,5 +1076,4 @@ async def quick_scan():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-
     uvicorn.run(app, host="0.0.0.0", port=port)
