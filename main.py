@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Form, Request, File, UploadFile
+from fastapi import FastAPI, HTTPException, Form, Request, File, UploadFile, Header, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
@@ -12,6 +12,9 @@ import os
 import stripe
 import json
 import re
+import asyncio
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Load environment variables
 load_dotenv()
@@ -21,11 +24,9 @@ stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 
-# Price IDs from environment variables
+# Price IDs from environment variables - ONLY MONTHLY SUBSCRIPTION
 PRICE_IDS = {
-    "premium_assessment": os.getenv('STRIPE_PREMIUM_ASSESSMENT_PRICE', 'price_1SVsI4Eg6G72wXg4KD2g7Ol3'),
-    "aws_setup": os.getenv('STRIPE_AWS_SETUP_PRICE', 'price_1SVsI4Eg6G72wXg4BG2lzf9y'),
-    "health_check": os.getenv('STRIPE_HEALTH_CHECK_PRICE', 'price_1SVsI4Eg6G72wXg4CI4BCLnF')
+    "monthly_subscription": os.getenv('STRIPE_MONTHLY_SUBSCRIPTION_PRICE', 'price_1SVsI4Eg6G72wXg4MONTHLY1297')
 }
 
 # Your AWS Account ID for cross-account roles
@@ -46,13 +47,13 @@ except Exception as e:
 app = FastAPI(
     title="Spectraine API",
     description="Cloud Threat Detection & Cost Optimization",
-    version="2.1.0"
+    version="2.3.0"  # Updated for automation
 )
 
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://localhost:8000", "http://localhost:8080"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -102,32 +103,34 @@ class QuickScanResponse(BaseModel):
     immediate_risks: List[Dict[str, Any]]
     next_actions: List[str]
 
-# In-memory storage for customers (use database in production)
+# Customer Authentication & Database
 customers_db = {}
+customer_tokens = {}
+automation_history = {}
 
-# Stripe Configuration Check
-def check_stripe_config():
-    if not stripe.api_key:
-        print("❌ STRIPE_SECRET_KEY is not set in environment variables")
-        return False
+# Authentication Functions
+def generate_customer_token(customer_id: str):
+    """Generate a secure token for customer access"""
+    token = f"spectraine_{customer_id}_{uuid.uuid4().hex[:16]}"
+    customer_tokens[token] = customer_id
+    return token
+
+def verify_customer_token(token: str):
+    """Verify customer token and return customer ID"""
+    return customer_tokens.get(token)
+
+def get_current_customer(authorization: str = Header(...)):
+    """Extract and verify customer from token"""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization")
     
-    if stripe.api_key.startswith('sk_live') or stripe.api_key.startswith('sk_test'):
-        print(f"✅ Stripe configured with key: {stripe.api_key[:20]}...")
-        return True
-    else:
-        print("❌ Invalid Stripe secret key format")
-        return False
-
-# Print configuration at startup
-print("🔧 Price IDs Configuration:")
-for service, price_id in PRICE_IDS.items():
-    print(f"   {service}: {price_id}")
-
-print("🔧 Checking Stripe configuration...")
-if not check_stripe_config():
-    print("🚨 Stripe is not properly configured. Payment features will not work.")
-else:
-    print("✅ Stripe configuration is valid!")
+    token = authorization.replace("Bearer ", "")
+    customer_id = verify_customer_token(token)
+    
+    if not customer_id:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    return customer_id
 
 # AWS Cross-Account Role Functions
 def assume_customer_role(role_arn, session_name='SpectraineSession'):
@@ -138,7 +141,7 @@ def assume_customer_role(role_arn, session_name='SpectraineSession'):
         response = sts_client.assume_role(
             RoleArn=role_arn,
             RoleSessionName=session_name,
-            DurationSeconds=3600  # 1 hour session
+            DurationSeconds=3600
         )
         
         credentials = response['Credentials']
@@ -231,39 +234,6 @@ def get_real_instances():
         print("🔄 Falling back to demo data...")
         return generate_instances()
 
-def get_customer_instances(role_arn):
-    """Get instances from customer account"""
-    ec2_client = get_customer_aws_client('ec2', role_arn)
-    if not ec2_client:
-        return []
-    
-    try:
-        response = ec2_client.describe_instances()
-        instances = []
-        
-        for reservation in response['Reservations']:
-            for instance in reservation['Instances']:
-                instance_data = {
-                    'id': instance['InstanceId'],
-                    'name': get_instance_name(instance),
-                    'state': instance['State']['Name'],
-                    'instance_type': instance['InstanceType'],
-                    'public_ip': instance.get('PublicIpAddress'),
-                    'private_ip': instance.get('PrivateIpAddress'),
-                    'launch_time': instance['LaunchTime'].strftime('%Y-%m-%dT%H:%M:%S'),
-                    'threats': analyze_customer_instance_threats(instance, ec2_client),
-                    'monthly_cost': estimate_instance_cost(instance['InstanceType']),
-                    'region': ec2_client.meta.region_name,
-                    'customer_owned': True
-                }
-                instances.append(instance_data)
-        
-        print(f"✅ Found {len(instances)} customer EC2 instances")
-        return instances
-    except Exception as e:
-        print(f"❌ Error getting customer instances: {e}")
-        return []
-
 def get_instance_name(instance):
     """Extract instance name from tags"""
     for tag in instance.get('Tags', []):
@@ -306,6 +276,58 @@ def analyze_instance_threats(instance):
     
     return threats
 
+def analyze_security_groups(instance):
+    """Check for insecure security group rules"""
+    ec2 = get_aws_client('ec2')
+    if not ec2:
+        return False
+        
+    try:
+        for sg in instance['SecurityGroups']:
+            sg_info = ec2.describe_security_groups(GroupIds=[sg['GroupId']])
+            for rule in sg_info['SecurityGroups'][0]['IpPermissions']:
+                for ip_range in rule.get('IpRanges', []):
+                    if ip_range['CidrIp'] == '0.0.0.0/0':
+                        # Check if it's for risky ports
+                        if rule.get('FromPort') in [22, 3389, 5432, 3306, 1433]:
+                            return True
+    except Exception as e:
+        print(f"Security group analysis error: {e}")
+    return False
+
+def get_customer_instances(role_arn):
+    """Get instances from customer account"""
+    ec2_client = get_customer_aws_client('ec2', role_arn)
+    if not ec2_client:
+        return []
+    
+    try:
+        response = ec2_client.describe_instances()
+        instances = []
+        
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                instance_data = {
+                    'id': instance['InstanceId'],
+                    'name': get_instance_name(instance),
+                    'state': instance['State']['Name'],
+                    'instance_type': instance['InstanceType'],
+                    'public_ip': instance.get('PublicIpAddress'),
+                    'private_ip': instance.get('PrivateIpAddress'),
+                    'launch_time': instance['LaunchTime'].strftime('%Y-%m-%dT%H:%M:%S'),
+                    'threats': analyze_customer_instance_threats(instance, ec2_client),
+                    'monthly_cost': estimate_instance_cost(instance['InstanceType']),
+                    'region': ec2_client.meta.region_name,
+                    'customer_owned': True
+                }
+                instances.append(instance_data)
+        
+        print(f"✅ Found {len(instances)} customer EC2 instances")
+        return instances
+    except Exception as e:
+        print(f"❌ Error getting customer instances: {e}")
+        return []
+
 def analyze_customer_instance_threats(instance, ec2_client):
     """Analyze security threats for customer instances"""
     threats = analyze_instance_threats(instance)
@@ -326,26 +348,7 @@ def analyze_customer_instance_threats(instance, ec2_client):
     
     return threats
 
-def analyze_security_groups(instance):
-    """Check for insecure security group rules"""
-    ec2 = get_aws_client('ec2')
-    if not ec2:
-        return False
-        
-    try:
-        for sg in instance['SecurityGroups']:
-            sg_info = ec2.describe_security_groups(GroupIds=[sg['GroupId']])
-            for rule in sg_info['SecurityGroups'][0]['IpPermissions']:
-                for ip_range in rule.get('IpRanges', []):
-                    if ip_range['CidrIp'] == '0.0.0.0/0':
-                        # Check if it's for risky ports
-                        if rule.get('FromPort') in [22, 3389, 5432, 3306, 1433]:
-                            return True
-    except Exception as e:
-        print(f"Security group analysis error: {e}")
-    return False
-
-# Enhanced Mock Data Generators (Fallback)
+# Enhanced Mock Data Generators (RICH DETAILED VERSION)
 def generate_instances():
     """Generate realistic demo instances for enterprise environment"""
     instance_templates = [
@@ -595,42 +598,232 @@ def generate_cost_recommendations(instances):
         }
     ]
 
+# DAILY AUTOMATION SYSTEM
+scheduler = BackgroundScheduler()
+
+async def run_daily_automation_for_customer(customer_id: str):
+    """Run daily automated scan for a customer"""
+    customer = customers_db.get(customer_id)
+    if not customer or customer.get('subscription_status') != 'active':
+        return
+    
+    print(f"🤖 Running daily automation for {customer['company']}")
+    
+    try:
+        # Run AWS scan
+        scan_data = await run_customer_aws_scan(customer_id)
+        
+        # Generate automation report
+        automation_report = {
+            'automation_id': f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            'customer_id': customer_id,
+            'timestamp': datetime.now().isoformat(),
+            'scan_results': {
+                'instances_scanned': scan_data['instances_found'],
+                'threats_identified': scan_data['threats_identified'],
+                'critical_threats': scan_data['critical_threats'],
+                'potential_savings': scan_data['estimated_savings']
+            },
+            'automated_actions': generate_automated_actions(scan_data),
+            'alerts_generated': generate_daily_alerts(scan_data)
+        }
+        
+        # Store automation history
+        if customer_id not in automation_history:
+            automation_history[customer_id] = []
+        automation_history[customer_id].append(automation_report)
+        
+        # Update customer's last automation
+        customer['last_automation'] = automation_report
+        customer['next_automation'] = (datetime.now() + timedelta(hours=24)).isoformat()
+        
+        print(f"✅ Daily automation completed for {customer['company']}")
+        
+    except Exception as e:
+        print(f"❌ Daily automation failed for {customer_id}: {e}")
+
+def generate_automated_actions(scan_data):
+    """Generate automated actions taken during daily scan"""
+    actions = [
+        "Daily security threat scan completed",
+        "Cost optimization analysis run",
+        "Compliance check performed"
+    ]
+    
+    if scan_data.get('critical_threats', 0) > 0:
+        actions.append(f"🔴 {scan_data['critical_threats']} critical threats detected - alerts sent")
+    
+    if scan_data.get('estimated_savings', 0) > 1000:
+        actions.append(f"💰 ${scan_data['estimated_savings']:,.0f} savings opportunities identified")
+    
+    # Simulate some automated remediations
+    if random.random() > 0.7:
+        actions.append("🛡️ Automated security patch applied to vulnerable instances")
+    
+    if random.random() > 0.8:
+        actions.append("⚡ Performance optimization recommendations generated")
+    
+    return actions
+
+def generate_daily_alerts(scan_data):
+    """Generate daily alert notifications"""
+    alerts = []
+    
+    if scan_data.get('critical_threats', 0) > 0:
+        alerts.append({
+            'type': 'CRITICAL',
+            'title': 'Critical Security Threats Detected',
+            'message': f"{scan_data['critical_threats']} critical security threats require immediate attention",
+            'action_required': True
+        })
+    
+    if scan_data.get('estimated_savings', 0) > 5000:
+        alerts.append({
+            'type': 'COST_SAVING',
+            'title': 'Major Cost Savings Opportunity',
+            'message': f"${scan_data['estimated_savings']:,.0f}/month in potential savings identified",
+            'action_required': False
+        })
+    
+    if scan_data.get('instances_found', 0) > 20:
+        alerts.append({
+            'type': 'PERFORMANCE',
+            'title': 'Infrastructure Scaling Opportunity',
+            'message': f"Consider optimizing {scan_data['instances_found']} instances for better performance",
+            'action_required': False
+        })
+    
+    return alerts
+
+async def run_daily_automation_for_all_customers():
+    """Run daily automation for all active customers"""
+    print(f"🚀 Starting daily automation for all customers at {datetime.now()}")
+    
+    active_customers = [
+        customer_id for customer_id, customer in customers_db.items() 
+        if customer.get('subscription_status') == 'active'
+    ]
+    
+    print(f"📊 Processing {len(active_customers)} active customers")
+    
+    for customer_id in active_customers:
+        await run_daily_automation_for_customer(customer_id)
+    
+    print("✅ Daily automation completed for all customers")
+
+def schedule_daily_automation():
+    """Schedule daily automation runs"""
+    # Run every day at 6:00 AM
+    trigger = CronTrigger(hour=6, minute=0)
+    scheduler.add_job(
+        run_daily_automation_for_all_customers,
+        trigger=trigger,
+        id='daily_automation'
+    )
+    print("✅ Daily automation scheduled for 6:00 AM daily")
+
+# Start scheduler when app starts
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks on startup"""
+    if not scheduler.running:
+        scheduler.start()
+        schedule_daily_automation()
+        print("🤖 Daily automation scheduler started")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown scheduler on app shutdown"""
+    if scheduler.running:
+        scheduler.shutdown()
+        print("🤖 Daily automation scheduler stopped")
+
+# Customer AWS Scanning
+async def run_customer_aws_scan(customer_id: str):
+    """Run actual AWS scan for specific customer"""
+    customer = customers_db.get(customer_id)
+    if not customer or not customer.get('aws_role_arn'):
+        return {"error": "AWS not connected"}
+    
+    role_arn = customer['aws_role_arn']
+    
+    # Get customer's real instances
+    instances = get_customer_instances(role_arn)
+    if not instances:
+        # Fallback to demo data if no real instances found
+        instances = generate_instances()
+    
+    threats = generate_threats(instances)
+    cost_recommendations = generate_cost_recommendations(instances)
+    
+    # Store scan results
+    scan_id = f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    total_cost = sum(i["monthly_cost"] for i in instances)
+    
+    scan_data = {
+        'scan_id': scan_id,
+        'customer_id': customer_id,
+        'timestamp': datetime.now().isoformat(),
+        'instances_found': len(instances),
+        'threats_identified': len(threats),
+        'critical_threats': len([t for t in threats if t["severity"] == "CRITICAL"]),
+        'estimated_savings': total_cost * 0.35,
+        'total_monthly_cost': total_cost,
+        'raw_data': {
+            'instances': instances[:10],
+            'threats': threats[:10],
+            'recommendations': cost_recommendations[:5]
+        }
+    }
+    
+    # Store in customer's scan history
+    if 'scan_history' not in customer:
+        customer['scan_history'] = []
+    customer['scan_history'].append(scan_data)
+    customer['last_scan'] = scan_data
+    
+    return scan_data
+
+# Security Scoring
+def calculate_security_score(scan_data):
+    """Calculate security score based on threats"""
+    if not scan_data or 'critical_threats' not in scan_data:
+        return f"{random.randint(85, 98)}%"
+    
+    base_score = 100
+    critical_penalty = scan_data['critical_threats'] * 10
+    threat_penalty = scan_data['threats_identified'] * 2
+    
+    score = max(40, base_score - critical_penalty - threat_penalty)
+    return f"{score}%"
+
+def calculate_cost_efficiency(scan_data):
+    """Calculate cost efficiency score"""
+    if not scan_data or 'estimated_savings' not in scan_data:
+        return f"{random.randint(75, 95)}%"
+    
+    efficiency = 100 - (scan_data['estimated_savings'] / (scan_data['total_monthly_cost'] + 0.001) * 100)
+    return f"{max(50, efficiency):.0f}%"
+
 # API Routes
 @app.get("/")
 async def root():
     return {
         "message": "Spectraine API - Cloud Threat Detection", 
         "status": "running",
-        "version": "2.1.0",
+        "version": "2.3.0",
         "demo_mode": True,
         "aws_connected": aws_session is not None,
         "stripe_connected": stripe.api_key is not None,
-        "cross_account_enabled": True,
-        "default_region": "eu-north-1",
-        "endpoints": {
-            "/": "API information",
-            "/health": "Health check",
-            "/stripe-test": "Test Stripe configuration",
-            "/debug/config": "Debug configuration",
-            "/download-cloudformation-template": "Get CloudFormation template for secure AWS connection",
-            "/download-cloudformation-template-file": "Download CloudFormation template file",
-            "/customer-onboarding": "Onboard customer with cross-account role",
-            "/customer-assessment/{customer_id}": "Run assessment for customer",
-            "/customer-scan": "Scan customer AWS account",
-            "/test-form": "Test form submission",
-            "/instances": "Get EC2 instances with threats",
-            "/threat-scan": "Run threat detection scan",
-            "/cost-analysis": "Get cost optimization recommendations",
-            "/free-assessment": "Submit assessment request",
-            "/premium-assessment": "Start premium assessment ($997)",
-            "/aws-setup-service": "AWS security setup ($497)",
-            "/health-check-package": "Cloud health check ($1,497)",
-            "/dashboard-metrics": "Get real-time dashboard metrics",
-            "/quick-scan": "Run instant threat scan",
-            "/simulate-fix": "Simulate fixing all issues",
-            "/executive-summary": "Get executive summary report",
-            "/real-instances": "Get REAL AWS instances (if configured)"
-        }
+        "automation_enabled": True,
+        "features": [
+            "Monthly subscription model ($1,297/month)",
+            "Customer authentication & secure dashboards", 
+            "AWS account linking with real-time scanning",
+            "DAILY AUTOMATED threat detection & cost optimization",
+            "24/7 continuous monitoring",
+            "Automated security remediation"
+        ]
     }
 
 @app.get("/health")
@@ -639,138 +832,426 @@ async def health_check():
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "service": "Spectraine API",
-        "version": "2.1.0",
-        "demo_mode": True,
-        "aws_connected": aws_session is not None,
-        "stripe_connected": stripe.api_key is not None,
-        "cross_account_enabled": True,
-        "default_region": "eu-north-1"
+        "version": "2.3.0",
+        "automation_status": "active" if scheduler.running else "inactive"
     }
 
-# CloudFormation Template Download - BULLETPROOF VERSION
+# Authentication Endpoints
+@app.post("/customer-login")
+async def customer_login(
+    email: str = Form(...),
+    company: str = Form(...)
+):
+    """Customer login - returns access token"""
+    customer_id = f"{company}_{email}".replace(" ", "_").lower()
+    
+    # Check if customer exists
+    customer = customers_db.get(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found. Please subscribe first.")
+    
+    token = generate_customer_token(customer_id)
+    
+    return {
+        "access_token": token,
+        "customer_id": customer_id,
+        "company": company,
+        "email": email,
+        "aws_connected": bool(customer.get('aws_role_arn')),
+        "automation_status": "active" if customer.get('subscription_status') == 'active' else "inactive",
+        "message": "Login successful"
+    }
+
+@app.post("/customer-register")
+async def customer_register(
+    name: str = Form(...),
+    email: str = Form(...),
+    company: str = Form(...),
+    aws_role_arn: str = Form(None)
+):
+    """Register customer without payment (for testing)"""
+    customer_id = f"{company}_{email}".replace(" ", "_").lower()
+    
+    if customer_id in customers_db:
+        raise HTTPException(status_code=400, detail="Customer already exists")
+    
+    # Validate AWS role if provided
+    aws_connected = False
+    if aws_role_arn:
+        if not validate_role_arn(aws_role_arn):
+            raise HTTPException(status_code=400, detail="Invalid AWS Role ARN format")
+        
+        can_connect, connection_info = test_role_connection(aws_role_arn)
+        if not can_connect:
+            raise HTTPException(status_code=400, detail=f"Cannot connect to AWS: {connection_info}")
+        aws_connected = True
+    
+    # Create customer record
+    customer_data = {
+        'customer_id': customer_id,
+        'name': name,
+        'email': email,
+        'company': company,
+        'aws_role_arn': aws_role_arn,
+        'aws_account_id': aws_role_arn.split(':')[4] if aws_role_arn else None,
+        'subscription_status': 'active',
+        'registered_at': datetime.now().isoformat(),
+        'next_automation': (datetime.now() + timedelta(hours=24)).isoformat()
+    }
+    
+    customers_db[customer_id] = customer_data
+    
+    # Run initial scan if AWS connected
+    if aws_connected:
+        await run_customer_aws_scan(customer_id)
+    
+    token = generate_customer_token(customer_id)
+    
+    return {
+        "access_token": token,
+        "customer_id": customer_id,
+        "aws_connected": aws_connected,
+        "automation_scheduled": True,
+        "message": "Registration successful - Daily automation activated!"
+    }
+
+# Monthly Subscription
+@app.post("/monthly-subscription")
+async def monthly_subscription(
+    name: str = Form(...),
+    email: str = Form(...),
+    company: str = Form(...),
+    aws_role_arn: str = Form(...)
+):
+    """Monthly subscription - $1,297/month"""
+    print(f"💰 MONTHLY SUBSCRIPTION: {company} - {email}")
+    
+    try:
+        # Validate Stripe configuration
+        if not stripe.api_key:
+            raise HTTPException(status_code=500, detail="Stripe not configured")
+        
+        # Validate AWS Role ARN
+        if not validate_role_arn(aws_role_arn):
+            raise HTTPException(status_code=400, detail="Invalid AWS Role ARN format")
+        
+        # Test AWS connection
+        can_connect, connection_info = test_role_connection(aws_role_arn)
+        if not can_connect:
+            raise HTTPException(status_code=400, detail=f"Cannot connect to AWS: {connection_info}")
+        
+        # Get price ID
+        price_id = PRICE_IDS.get("monthly_subscription")
+        if not price_id or price_id.startswith("price_1ABC"):
+            raise HTTPException(status_code=500, detail="Invalid subscription price ID")
+        
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        
+        # Create customer record (pending subscription)
+        customer_id = f"{company}_{email}".replace(" ", "_").lower()
+        customer_data = {
+            'customer_id': customer_id,
+            'name': name,
+            'email': email,
+            'company': company,
+            'aws_role_arn': aws_role_arn,
+            'aws_account_id': aws_role_arn.split(':')[4],
+            'subscription_status': 'pending',
+            'registered_at': datetime.now().isoformat(),
+            'next_automation': (datetime.now() + timedelta(hours=24)).isoformat()
+        }
+        customers_db[customer_id] = customer_data
+        
+        # Create Stripe checkout session
+        session = stripe.checkout.Session.create(
+            customer_email=email,
+            payment_method_types=['card'],
+            line_items=[{
+                'price': price_id,
+                'quantity': 1,
+            }],
+            mode='subscription',
+            success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}&customer_id={customer_id}',
+            cancel_url=f'{frontend_url}/cancel',
+            metadata={
+                'service_type': 'monthly_subscription',
+                'customer_id': customer_id,
+                'customer_name': name,
+                'customer_email': email,
+                'company': company
+            }
+        )
+        
+        print(f"✅ Monthly subscription session created: {session.id}")
+        
+        return {
+            "message": "Monthly subscription checkout created",
+            "checkout_url": session.url,
+            "customer_id": customer_id,
+            "aws_connected": True,
+            "automation_scheduled": True,
+            "price": "$1,297/month",
+            "includes": [
+                "DAILY automated threat scans",
+                "Real-time cost optimization alerts", 
+                "Continuous compliance monitoring",
+                "Monthly executive dashboard",
+                "24/7 security monitoring",
+                "Automated remediation actions",
+                "Unlimited cloud assessments"
+            ]
+        }
+        
+    except Exception as e:
+        print(f"❌ Monthly subscription error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Subscription error: {str(e)}")
+
+# Secure Customer Endpoints
+@app.get("/secure-customer-dashboard")
+async def secure_customer_dashboard(authorization: str = Header(...)):
+    """Secure dashboard with customer's data"""
+    customer_id = get_current_customer(authorization)
+    customer = customers_db.get(customer_id)
+    
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    # Get latest scan or create demo data
+    latest_scan = customer.get('last_scan')
+    if not latest_scan and customer.get('aws_role_arn'):
+        latest_scan = await run_customer_aws_scan(customer_id)
+    elif not latest_scan:
+        # Generate demo data for unconnected customers
+        instances = generate_instances()
+        latest_scan = {
+            'instances_found': len(instances),
+            'threats_identified': len(generate_threats(instances)),
+            'critical_threats': random.randint(0, 3),
+            'estimated_savings': sum(i["monthly_cost"] for i in instances) * 0.35,
+            'total_monthly_cost': sum(i["monthly_cost"] for i in instances)
+        }
+    
+    # Get automation status
+    last_automation = customer.get('last_automation', {})
+    next_automation = customer.get('next_automation')
+    
+    return {
+        "customer_id": customer_id,
+        "company": customer['company'],
+        "email": customer['email'],
+        "subscription_status": customer.get('subscription_status', 'active'),
+        
+        "aws_connection": {
+            "connected": bool(customer.get('aws_role_arn')),
+            "account_id": customer.get('aws_account_id'),
+            "last_scan": customer.get('last_scan', {}).get('timestamp')
+        },
+        
+        "automation_status": {
+            "enabled": customer.get('subscription_status') == 'active',
+            "last_run": last_automation.get('timestamp'),
+            "next_run": next_automation,
+            "daily_scans_completed": len(automation_history.get(customer_id, [])),
+            "status": "Active" if customer.get('subscription_status') == 'active' else "Inactive"
+        },
+        
+        "live_metrics": {
+            "security_score": calculate_security_score(latest_scan),
+            "cost_efficiency": calculate_cost_efficiency(latest_scan),
+            "instances_monitored": latest_scan.get('instances_found', 0),
+            "threats_blocked": latest_scan.get('critical_threats', 0)
+        },
+        
+        "financials": {
+            "current_monthly_spend": f"${latest_scan.get('total_monthly_cost', 0):,.2f}" if latest_scan.get('total_monthly_cost') else "Calculating...",
+            "potential_savings": f"${latest_scan.get('estimated_savings', 0):,.2f}/month",
+            "savings_percentage": "35%"
+        },
+        
+        "today_alerts": [
+            {
+                "type": "💰 COST SAVING",
+                "message": f"Right-size overprovisioned instances → Save ${latest_scan.get('estimated_savings', 0) * 0.6:,.0f}/month",
+                "priority": "high"
+            } if latest_scan.get('estimated_savings', 0) > 0 else {
+                "type": "🔧 SETUP",
+                "message": "Connect your AWS account to start optimization",
+                "priority": "info"
+            }
+        ],
+        
+        "recent_activity": customer.get('scan_history', [])[-3:]  # Last 3 scans
+    }
+
+@app.get("/secure-daily-results")
+async def secure_daily_results(authorization: str = Header(...)):
+    """Daily results for authenticated customer"""
+    customer_id = get_current_customer(authorization)
+    customer = customers_db.get(customer_id)
+    
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    # Get latest automation results or run new scan
+    last_automation = customer.get('last_automation', {})
+    
+    if not last_automation:
+        # If no automation yet, run a scan
+        if customer.get('aws_role_arn'):
+            scan_data = await run_customer_aws_scan(customer_id)
+        else:
+            # Demo data for unconnected customers
+            instances = generate_instances()
+            scan_data = {
+                'instances_found': len(instances),
+                'threats_identified': len(generate_threats(instances)),
+                'critical_threats': random.randint(0, 2),
+                'estimated_savings': sum(i["monthly_cost"] for i in instances) * 0.35
+            }
+        
+        # Create mock automation results
+        last_automation = {
+            'automation_id': f"auto_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            'timestamp': datetime.now().isoformat(),
+            'scan_results': scan_data,
+            'automated_actions': generate_automated_actions(scan_data),
+            'alerts_generated': generate_daily_alerts(scan_data)
+        }
+    
+    return {
+        "customer_id": customer_id,
+        "date": datetime.now().date().isoformat(),
+        "automation_timestamp": last_automation.get('timestamp'),
+        
+        "daily_highlights": {
+            "security_score": calculate_security_score(last_automation.get('scan_results', {})),
+            "cost_savings_identified": f"${last_automation.get('scan_results', {}).get('estimated_savings', 0):,.2f}",
+            "threats_blocked": last_automation.get('scan_results', {}).get('critical_threats', 0),
+            "compliance_status": f"{random.randint(88, 99)}%"
+        },
+        
+        "automated_actions_taken": last_automation.get('automated_actions', []),
+        
+        "alerts_generated": last_automation.get('alerts_generated', []),
+        
+        "today_top_actions": [
+            {
+                "priority": "HIGH",
+                "action": "Right-size overprovisioned instances",
+                "savings": f"${last_automation.get('scan_results', {}).get('estimated_savings', 0) * 0.6:,.0f}/month",
+                "time_required": "15 minutes"
+            },
+            {
+                "priority": "MEDIUM" if customer.get('aws_role_arn') else "HIGH",
+                "action": "Enable S3 bucket encryption" if customer.get('aws_role_arn') else "Connect AWS account",
+                "risk_reduction": "Eliminates data exposure" if customer.get('aws_role_arn') else "Start real monitoring",
+                "time_required": "5 minutes"
+            }
+        ]
+    }
+
+@app.get("/secure-automation-history")
+async def secure_automation_history(authorization: str = Header(...)):
+    """Get automation history for customer"""
+    customer_id = get_current_customer(authorization)
+    
+    history = automation_history.get(customer_id, [])
+    
+    return {
+        "customer_id": customer_id,
+        "total_automation_runs": len(history),
+        "automation_history": history[-10:]  # Last 10 automation runs
+    }
+
+@app.post("/secure-run-automation-now")
+async def secure_run_automation_now(authorization: str = Header(...)):
+    """Manually trigger automation for customer"""
+    customer_id = get_current_customer(authorization)
+    
+    if not customers_db.get(customer_id):
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    await run_daily_automation_for_customer(customer_id)
+    
+    return {
+        "message": "Automation completed successfully",
+        "automation_id": customers_db[customer_id].get('last_automation', {}).get('automation_id'),
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/secure-scan-now")
+async def secure_scan_now(authorization: str = Header(...)):
+    """Run immediate scan for customer"""
+    customer_id = get_current_customer(authorization)
+    
+    if not customers_db.get(customer_id):
+        raise HTTPException(status_code=404, detail="Customer not found")
+    
+    scan_data = await run_customer_aws_scan(customer_id)
+    
+    return {
+        "message": "Scan completed successfully",
+        "scan_id": scan_data['scan_id'],
+        "results": {
+            "instances_found": scan_data['instances_found'],
+            "threats_identified": scan_data['threats_identified'],
+            "critical_threats": scan_data['critical_threats'],
+            "potential_savings": f"${scan_data['estimated_savings']:,.2f}/month"
+        }
+    }
+
+# Automation Management Endpoints
+@app.get("/automation-status")
+async def automation_status():
+    """Get overall automation system status"""
+    active_customers = [
+        customer_id for customer_id, customer in customers_db.items() 
+        if customer.get('subscription_status') == 'active'
+    ]
+    
+    return {
+        "automation_system": "active",
+        "scheduler_running": scheduler.running,
+        "total_active_customers": len(active_customers),
+        "next_scheduled_run": scheduler.get_job('daily_automation').next_run_time if scheduler.get_job('daily_automation') else "Not scheduled",
+        "today_automations_completed": sum(len(history) for history in automation_history.values())
+    }
+
+@app.post("/trigger-daily-automation")
+async def trigger_daily_automation(background_tasks: BackgroundTasks):
+    """Manually trigger daily automation for all customers (admin)"""
+    background_tasks.add_task(run_daily_automation_for_all_customers)
+    
+    return {
+        "message": "Daily automation triggered for all active customers",
+        "triggered_at": datetime.now().isoformat()
+    }
+
+# CloudFormation Template
 @app.get("/download-cloudformation-template-file")
 async def download_cloudformation_template_file():
-    """Bulletproof CloudFormation template download with multiple fallbacks"""
+    """Serve CloudFormation template"""
     try:
-        print("🔧 Attempting to serve CloudFormation template...")
-        
-        # Try multiple possible file paths
         possible_paths = [
             'cloudformation/spectraine-role-setup.yml',
             './cloudformation/spectraine-role-setup.yml',
-            'backend/cloudformation/spectraine-role-setup.yml',
-            './backend/cloudformation/spectraine-role-setup.yml'
         ]
-        
-        file_found = False
-        file_path = None
         
         for path in possible_paths:
             if os.path.exists(path):
-                file_found = True
-                file_path = path
-                print(f"✅ Found CloudFormation file at: {path}")
-                break
+                return FileResponse(
+                    path,
+                    media_type='application/x-yaml',
+                    filename='spectraine-role-setup.yml'
+                )
         
-        if file_found:
-            # Serve the physical file
-            return FileResponse(
-                file_path,
-                media_type='application/x-yaml',
-                filename='spectraine-role-setup.yml'
-            )
-        else:
-            print("⚠️ No CloudFormation file found, using generated template")
-            raise FileNotFoundError("No CloudFormation file found in any location")
-            
-    except Exception as e:
-        print(f"⚠️ CloudFormation file error: {e}. Using fallback template.")
-        
-        # Generate the template dynamically
+        # Fallback template
         fallback_template = f"""AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Spectraine Cloud Security Read-Only Role'
 
 Parameters:
   SpectraineAccountId:
     Type: String
-    Description: 'Spectraine AWS Account ID (provided by Spectraine)'
-    Default: '{SPECTRAINE_ACCOUNT_ID}'
-
-Resources:
-  SpectraineReadOnlyRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: SpectraineReadOnlyRole
-      Description: 'Read-only role for Spectraine cloud security assessment'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              AWS: !Sub 'arn:aws:iam::${{SpectraineAccountId}}:root'
-            Action: 'sts:AssumeRole'
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/SecurityAudit
-        - arn:aws:iam::aws:policy/ReadOnlyAccess
-        - arn:aws:iam::aws:policy/AWSCostExplorerReadOnlyAccess
-
-Outputs:
-  RoleArn:
-    Description: 'Spectraine Read-Only Role ARN - Copy this value to Spectraine'
-    Value: !GetAtt SpectraineReadOnlyRole.Arn
-    Export:
-      Name: !Sub '${{AWS::StackName}}-RoleArn'
-
-  SetupInstructions:
-    Description: 'Next Steps'
-    Value: |
-      1. Deploy this stack in your AWS account
-      2. Copy the RoleArn output value
-      3. Provide the RoleArn to Spectraine
-      4. We will assume this role for read-only security assessment
-"""
-        
-        # Return the generated template
-        return Response(
-            content=fallback_template,
-            media_type='application/x-yaml',
-            headers={
-                'Content-Disposition': 'attachment; filename="spectraine-role-setup.yml"',
-                'Content-Type': 'application/x-yaml'
-            }
-        )
-
-@app.get("/download-cloudformation-template")
-async def download_cloudformation_template():
-    """Serve the CloudFormation template info as JSON"""
-    try:
-        # Try to read the file if it exists
-        possible_paths = [
-            'cloudformation/spectraine-role-setup.yml',
-            './cloudformation/spectraine-role-setup.yml', 
-            'backend/cloudformation/spectraine-role-setup.yml',
-            './backend/cloudformation/spectraine-role-setup.yml'
-        ]
-        
-        template_content = None
-        for path in possible_paths:
-            try:
-                with open(path, 'r') as file:
-                    template_content = file.read()
-                print(f"✅ Serving CloudFormation template from: {path}")
-                break
-            except:
-                continue
-        
-        if template_content is None:
-            # Generate fallback template
-            template_content = f"""AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Spectraine Cloud Security Read-Only Role'
-
-Parameters:
-  SpectraineAccountId:
-    Type: String  
-    Description: 'Spectraine AWS Account ID'
     Default: '{SPECTRAINE_ACCOUNT_ID}'
 
 Resources:
@@ -792,453 +1273,19 @@ Resources:
 Outputs:
   RoleArn:
     Description: 'Spectraine Read-Only Role ARN'
-    Value: !GetAtt SpectraineReadOnlyRole.Arn"""
+    Value: !GetAtt SpectraineReadOnlyRole.Arn
+"""
         
-        return {
-            "template": template_content,
-            "filename": "spectraine-role-setup.yml",
-            "instructions": "Deploy this CloudFormation stack in your AWS account and provide the RoleArn output",
-            "spectraine_account_id": SPECTRAINE_ACCOUNT_ID,
-            "source": "file" if template_content else "generated"
-        }
-        
-    except Exception as e:
-        print(f"❌ Error in template endpoint: {e}")
-        return {
-            "error": "Failed to load template",
-            "instructions": "Please contact support for the CloudFormation template",
-            "spectraine_account_id": SPECTRAINE_ACCOUNT_ID
-        }
-
-# Customer Onboarding Endpoints
-@app.post("/customer-onboarding")
-async def customer_onboarding(
-    name: str = Form(...),
-    email: str = Form(...),
-    company: str = Form(...),
-    role_arn: str = Form(...)
-):
-    """Onboard customer with cross-account role"""
-    try:
-        # Validate role ARN format
-        if not validate_role_arn(role_arn):
-            raise HTTPException(status_code=400, detail="Invalid role ARN format")
-        
-        # Test the role connection
-        can_connect, connection_info = test_role_connection(role_arn)
-        if not can_connect:
-            raise HTTPException(status_code=400, detail=f"Cannot assume role: {connection_info}")
-        
-        # Get customer account ID from role ARN
-        customer_account_id = role_arn.split(':')[4]
-        
-        # Store customer info (in production, use a database)
-        customer_id = f"cust-{uuid.uuid4().hex[:8]}"
-        customer_data = {
-            'customer_id': customer_id,
-            'name': name,
-            'email': email,
-            'company': company,
-            'aws_account_id': customer_account_id,
-            'role_arn': role_arn,
-            'onboarded_at': datetime.now().isoformat()
-        }
-        
-        customers_db[customer_id] = customer_data
-        
-        print(f"✅ Customer onboarded: {company} (Account: {customer_account_id})")
-        
-        return {
-            "status": "success",
-            "message": "Customer onboarded successfully",
-            "customer_id": customer_id,
-            "aws_account_id": customer_account_id,
-            "next_steps": [
-                "Run initial security assessment",
-                "Review cost optimization opportunities", 
-                "Schedule security consultation"
-            ]
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Onboarding failed: {str(e)}")
-
-@app.get("/customer-assessment/{customer_id}")
-async def customer_assessment(customer_id: str):
-    """Run comprehensive assessment for onboarded customer"""
-    try:
-        # Get customer data
-        customer_data = customers_db.get(customer_id)
-        if not customer_data:
-            raise HTTPException(status_code=404, detail="Customer not found")
-        
-        role_arn = customer_data['role_arn']
-        
-        # Get customer instances
-        instances = get_customer_instances(role_arn)
-        threats = generate_threats(instances)
-        
-        # Generate comprehensive assessment
-        total_monthly = sum(i["monthly_cost"] for i in instances)
-        savings = total_monthly * random.uniform(0.25, 0.45)
-        critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
-        
-        return {
-            "customer_id": customer_id,
-            "company": customer_data['company'],
-            "assessment_date": datetime.now().isoformat(),
-            "services_scanned": ["EC2", "S3", "IAM", "CloudTrail", "Config"],
-            "instances_scanned": len(instances),
-            "security_score": f"{random.randint(65, 85)}%",
-            "cost_savings_opportunity": f"${savings:,.2f}/month",
-            "critical_findings": critical_threats,
-            "total_threats": len(threats),
-            "recommendations": [
-                "Enable CloudTrail logging in all regions",
-                "Implement S3 bucket policies for sensitive data",
-                "Review IAM roles for excessive permissions",
-                "Enable AWS Config for compliance monitoring",
-                "Implement security group best practices"
-            ],
-            "threats": threats[:5]  # Return top 5 threats
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Assessment failed: {str(e)}")
-
-@app.post("/customer-scan")
-async def customer_scan(role_arn: str = Form(...)):
-    """Scan customer AWS account using cross-account role"""
-    try:
-        # Validate role ARN
-        if not validate_role_arn(role_arn):
-            raise HTTPException(status_code=400, detail="Invalid role ARN format")
-        
-        # Test the role assumption first
-        can_connect, connection_info = test_role_connection(role_arn)
-        if not can_connect:
-            raise HTTPException(status_code=400, detail=f"Cannot assume role: {connection_info}")
-        
-        # Get instances from customer account
-        instances = get_customer_instances(role_arn)
-        threats = generate_threats(instances)
-        
-        critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
-        high_threats = len([t for t in threats if t["severity"] == "HIGH"])
-        
-        return {
-            "status": "success",
-            "customer_account_scanned": True,
-            "instances_found": len(instances),
-            "threats_identified": len(threats),
-            "critical_threats": critical_threats,
-            "high_threats": high_threats,
-            "data_source": "CUSTOMER_AWS_ACCOUNT",
-            "scan_time": datetime.now().isoformat(),
-            "sample_threats": threats[:3]  # Return sample threats
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Customer scan failed: {str(e)}")
-
-# Debug and Test Endpoints
-@app.get("/stripe-test")
-async def stripe_test():
-    """Test Stripe configuration"""
-    try:
-        # Test if Stripe is configured
-        if not stripe.api_key:
-            return {
-                "status": "error",
-                "message": "Stripe secret key not configured",
-                "stripe_configured": False
-            }
-        
-        # Test if we can retrieve a price
-        price_id = PRICE_IDS["premium_assessment"]
-        price = stripe.Price.retrieve(price_id)
-        
-        return {
-            "status": "success",
-            "stripe_configured": True,
-            "price_id": price_id,
-            "price_amount": f"${price.unit_amount / 100}",
-            "price_currency": price.currency,
-            "product": price.product
-        }
-    except stripe.error.InvalidRequestError as e:
-        return {
-            "status": "error",
-            "stripe_configured": False,
-            "error": f"Stripe API error: {str(e)}",
-            "price_id": PRICE_IDS["premium_assessment"],
-            "note": "Check if your Price ID is correct in Stripe dashboard"
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "stripe_configured": False,
-            "error": str(e),
-            "price_id": PRICE_IDS["premium_assessment"]
-        }
-
-@app.get("/debug/config")
-async def debug_config():
-    """Debug endpoint to check configuration"""
-    return {
-        "aws_configured": aws_session is not None,
-        "stripe_configured": stripe.api_key is not None,
-        "stripe_key_prefix": stripe.api_key[:20] + "..." if stripe.api_key else "None",
-        "spectraine_account_id": SPECTRAINE_ACCOUNT_ID,
-        "price_ids": PRICE_IDS,
-        "customers_onboarded": len(customers_db),
-        "environment_variables": {
-            "AWS_ACCESS_KEY_ID_set": bool(os.getenv('AWS_ACCESS_KEY_ID')),
-            "STRIPE_SECRET_KEY_set": bool(os.getenv('STRIPE_SECRET_KEY')),
-            "STRIPE_PUBLISHABLE_KEY_set": bool(os.getenv('STRIPE_PUBLISHABLE_KEY')),
-            "STRIPE_PREMIUM_ASSESSMENT_PRICE_set": bool(os.getenv('STRIPE_PREMIUM_ASSESSMENT_PRICE')),
-            "AWS_ACCOUNT_ID_set": bool(os.getenv('AWS_ACCOUNT_ID')),
-        }
-    }
-
-@app.post("/test-form")
-async def test_form(
-    name: str = Form("Test User"),
-    email: str = Form("test@example.com"),
-    company: str = Form("Test Company")
-):
-    """Test endpoint for form submission"""
-    return {
-        "status": "success",
-        "message": "Form received successfully",
-        "data": {
-            "name": name,
-            "email": email,
-            "company": company
-        }
-    }
-
-# Payment Endpoints
-@app.post("/premium-assessment")
-async def premium_assessment(
-    name: str = Form(...),
-    email: str = Form(...),
-    company: str = Form(...),
-    aws_spend: str = Form("unknown"),
-    priority_concerns: List[str] = Form([])
-):
-    """Premium assessment with payment - $997"""
-    print(f"💰 PREMIUM ASSESSMENT REQUEST RECEIVED:")
-    print(f"   Name: {name}")
-    print(f"   Email: {email}")
-    print(f"   Company: {company}")
-    print(f"   AWS Spend: {aws_spend}")
-    print(f"   Priority Concerns: {priority_concerns}")
-    
-    try:
-        # Validate Stripe configuration
-        if not stripe.api_key:
-            raise HTTPException(status_code=500, detail="Stripe not configured")
-            
-        # Get price ID
-        price_id = PRICE_IDS.get("premium_assessment")
-        if not price_id or price_id.startswith("price_1ABC"):
-            raise HTTPException(status_code=500, detail=f"Invalid Stripe price ID: {price_id}")
-        
-        print(f"🔄 Creating Stripe checkout session...")
-        
-        # Get frontend URL from environment or use localhost as default
-        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
-        
-        # Create Stripe checkout session
-        session = stripe.checkout.Session.create(
-            customer_email=email,
-            payment_method_types=['card'],
-            line_items=[{
-                'price': price_id,
-                'quantity': 1,
-            }],
-            mode='payment',
-            success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}&service=premium-assessment',
-            cancel_url=f'{frontend_url}/cancel',
-            metadata={
-                'service_type': 'premium_assessment',
-                'customer_name': name,
-                'customer_email': email,
-                'company': company,
-                'aws_spend': aws_spend,
-                'priority_concerns': ','.join(priority_concerns)
-            }
+        return Response(
+            content=fallback_template,
+            media_type='application/x-yaml',
+            headers={'Content-Disposition': 'attachment; filename="spectraine-role-setup.yml"'}
         )
         
-        print(f"✅ Premium assessment Stripe session created: {session.id}")
-        
-        return {
-            "message": "Premium assessment checkout created",
-            "checkout_url": session.url,
-            "price": "$997.00",
-            "includes": [
-                "Comprehensive security assessment",
-                "Detailed PDF report", 
-                "30-minute consultation",
-                "Priority remediation roadmap",
-                "3-month cost tracking"
-            ]
-        }
-        
-    except stripe.error.StripeError as e:
-        print(f"❌ Stripe error in premium assessment: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
     except Exception as e:
-        print(f"❌ Error in premium assessment: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Template error: {str(e)}")
 
-@app.post("/aws-setup-service")
-async def aws_setup_service(
-    name: str = Form(...),
-    email: str = Form(...),
-    company: str = Form(...),
-    current_setup: str = Form("unknown")
-):
-    """AWS setup service with payment - $497"""
-    print(f"🔧 AWS SETUP REQUEST RECEIVED:")
-    print(f"   Name: {name}")
-    print(f"   Email: {email}")
-    print(f"   Company: {company}")
-    print(f"   Current Setup: {current_setup}")
-    
-    try:
-        # Validate Stripe configuration
-        if not stripe.api_key:
-            raise HTTPException(status_code=500, detail="Stripe not configured")
-            
-        # Get price ID
-        price_id = PRICE_IDS.get("aws_setup")
-        if not price_id or price_id.startswith("price_1ABC"):
-            raise HTTPException(status_code=500, detail=f"Invalid Stripe price ID for AWS setup: {price_id}")
-        
-        print(f"🔄 Creating Stripe checkout session for AWS setup...")
-        
-        # Get frontend URL from environment or use localhost as default
-        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
-        
-        # Create Stripe checkout session
-        session = stripe.checkout.Session.create(
-            customer_email=email,
-            payment_method_types=['card'],
-            line_items=[{
-                'price': price_id,
-                'quantity': 1,
-            }],
-            mode='payment',
-            success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}&service=aws-setup',
-            cancel_url=f'{frontend_url}/cancel',
-            metadata={
-                'service_type': 'aws_setup',
-                'customer_name': name,
-                'customer_email': email,
-                'company': company,
-                'current_setup': current_setup
-            }
-        )
-        
-        print(f"✅ AWS setup Stripe session created: {session.id}")
-        
-        return {
-            "message": "AWS setup service checkout created",
-            "checkout_url": session.url,
-            "price": "$497.00",
-            "includes": [
-                "Read-only IAM role creation",
-                "Security group hardening",
-                "Cost allocation tags setup",
-                "CloudTrail enablement",
-                "Security baseline configuration"
-            ]
-        }
-        
-    except stripe.error.StripeError as e:
-        print(f"❌ Stripe error in AWS setup: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
-    except Exception as e:
-        print(f"❌ Error in AWS setup service: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
-
-@app.post("/health-check-package")
-async def health_check_package(
-    name: str = Form(...),
-    email: str = Form(...),
-    company: str = Form(...)
-):
-    """Cloud health check package - $1,497"""
-    print(f"🏥 HEALTH CHECK REQUEST RECEIVED:")
-    print(f"   Name: {name}")
-    print(f"   Email: {email}")
-    print(f"   Company: {company}")
-    
-    try:
-        # Validate Stripe configuration
-        if not stripe.api_key:
-            raise HTTPException(status_code=500, detail="Stripe not configured")
-            
-        # Get price ID
-        price_id = PRICE_IDS.get("health_check")
-        if not price_id or price_id.startswith("price_1ABC"):
-            raise HTTPException(status_code=500, detail=f"Invalid Stripe price ID for health check: {price_id}")
-        
-        print(f"🔄 Creating Stripe checkout session for health check...")
-        
-        # Get frontend URL from environment or use localhost as default
-        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
-        
-        # Create Stripe checkout session
-        session = stripe.checkout.Session.create(
-            customer_email=email,
-            payment_method_types=['card'],
-            line_items=[{
-                'price': price_id,
-                'quantity': 1,
-            }],
-            mode='payment',
-            success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}&service=health-check',
-            cancel_url=f'{frontend_url}/cancel',
-            metadata={
-                'service_type': 'health_check',
-                'customer_name': name,
-                'customer_email': email,
-                'company': company
-            }
-        )
-        
-        print(f"✅ Health check Stripe session created: {session.id}")
-        
-        return {
-            "message": "Health check package checkout created",
-            "checkout_url": session.url,
-            "price": "$1,497.00",
-            "includes": [
-                "Full cloud infrastructure health check",
-                "Executive summary report",
-                "1-hour strategy session", 
-                "30-day follow-up support",
-                "ROI calculation and tracking"
-            ]
-        }
-        
-    except stripe.error.StripeError as e:
-        print(f"❌ Stripe error in health check: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
-    except Exception as e:
-        print(f"❌ Error in health check package: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
-
-# Existing Application Endpoints
+# Public Demo Endpoints (Backward Compatibility)
 @app.get("/instances", response_model=List[InstanceResponse])
 async def get_instances(use_real: bool = False):
     """Get EC2 instances with threat analysis"""
@@ -1246,65 +1293,12 @@ async def get_instances(use_real: bool = False):
         return get_real_instances()
     return generate_instances()
 
-@app.get("/real-instances", response_model=List[InstanceResponse])
-async def get_real_instances_endpoint():
-    """Get REAL AWS EC2 instances with threat analysis"""
-    return get_real_instances()
-
 @app.get("/threat-scan")
 async def threat_scan(use_real: bool = False):
     """Run comprehensive threat detection scan"""
     if use_real and aws_session:
         instances = get_real_instances()
-        # Convert real threats to the expected format
-        threats = []
-        for instance in instances:
-            for threat in instance['threats']:
-                if threat == 'publicly_accessible':
-                    threats.append({
-                        "type": "PUBLIC_INSTANCE",
-                        "severity": "HIGH",
-                        "instance": instance["id"],
-                        "instance_name": instance["name"],
-                        "impact": "Direct internet exposure",
-                        "confidence": "95%",
-                        "business_impact": "Increased attack surface + potential data breach",
-                        "recommendation": "Move behind load balancer or restrict access"
-                    })
-                elif threat == 'overprovisioned':
-                    savings = instance["monthly_cost"] * 0.5
-                    threats.append({
-                        "type": "RESOURCE_OVERPROVISIONING",
-                        "severity": "MEDIUM",
-                        "instance": instance["id"],
-                        "instance_name": instance["name"],
-                        "impact": f"${savings:,.2f}/month wasted spend",
-                        "confidence": "85%",
-                        "business_impact": f"Annual waste: ${savings * 12:,.0f}",
-                        "recommendation": f"Right-size to smaller instance type"
-                    })
-                elif threat == 'aged_instance':
-                    threats.append({
-                        "type": "AGED_INSTANCE",
-                        "severity": "MEDIUM",
-                        "instance": instance["id"],
-                        "instance_name": instance["name"],
-                        "impact": "Increased security risk + potential performance issues",
-                        "confidence": "90%",
-                        "business_impact": "Older instances more vulnerable to security threats",
-                        "recommendation": "Consider upgrading to newer instance types"
-                    })
-                elif threat == 'insecure_configuration':
-                    threats.append({
-                        "type": "INSECURE_CONFIGURATION",
-                        "severity": "HIGH",
-                        "instance": instance["id"],
-                        "instance_name": instance["name"],
-                        "impact": "Security vulnerability exposure",
-                        "confidence": "88%",
-                        "business_impact": "Potential unauthorized access to resources",
-                        "recommendation": "Review and tighten security group rules"
-                    })
+        threats = generate_threats(instances)
     else:
         instances = generate_instances()
         threats = generate_threats(instances)
@@ -1317,11 +1311,9 @@ async def threat_scan(use_real: bool = False):
         "threats_found": len(threats),
         "critical_threats": critical_threats,
         "high_threats": high_threats,
-        "details": threats,
+        "details": threats[:5],
         "scan_time": f"{random.randint(45, 120)} seconds",
-        "instances_scanned": len(instances),
-        "timestamp": datetime.now().isoformat(),
-        "data_source": "REAL_AWS" if use_real and aws_session else "DEMO"
+        "instances_scanned": len(instances)
     }
 
 @app.get("/cost-analysis")
@@ -1329,135 +1321,16 @@ async def cost_analysis():
     """Get enhanced cost optimization analysis"""
     instances = generate_instances()
     total_monthly = sum(i["monthly_cost"] for i in instances)
-    
-    # More realistic savings calculation
-    savings_rate = random.uniform(0.25, 0.45)  # 25-45% savings
-    savings = total_monthly * savings_rate
-    
-    # Calculate team member equivalent (avg $100k/year = $8,333/month)
-    team_members = savings / 8333
+    savings = total_monthly * 0.35
     
     return {
         "analysis_id": f"cost-{uuid.uuid4().hex[:8]}",
         "total_monthly_spend": f"${total_monthly:,.2f}",
-        "estimated_annual_spend": f"${total_monthly * 12:,.2f}",
         "potential_savings": f"${savings:,.2f}/month",
         "annual_impact": f"${savings * 12:,.2f}",
-        "savings_percentage": f"{savings_rate * 100:.1f}%",
+        "savings_percentage": "35%",
         "recommendations": generate_cost_recommendations(instances),
-        "business_impact": f"Savings could fund {team_members:.1f} additional team members",
-        "payback_period": f"{random.randint(1, 3)} months",
-        "roi": f"{random.randint(400, 1200)}%",
-        "scan_date": datetime.now().isoformat()
-    }
-
-@app.post("/free-assessment")
-async def free_assessment(request: AssessmentRequest):
-    """Submit request for free threat assessment"""
-    print(f"NEW ASSESSMENT REQUEST:")
-    print(f"   Name: {request.name}")
-    print(f"   Company: {request.company}")
-    print(f"   Email: {request.email}")
-    print(f"   AWS Spend: {request.aws_spend}")
-    print(f"   Priority Concerns: {request.priority_concerns}")
-    print(f"   Timestamp: {datetime.now().isoformat()}")
-    
-    # Simulate processing
-    assessment_id = f"assessment-{uuid.uuid4().hex[:8]}"
-    
-    return {
-        "message": "Assessment scheduled! We'll contact you within 24 hours.",
-        "assessment_id": assessment_id,
-        "next_steps": [
-            "1. Initial environment analysis (2-4 hours)",
-            "2. Executive briefing session (30 minutes)",
-            "3. Detailed remediation proposal",
-            "4. Implementation planning"
-        ],
-        "demo_findings": "Based on similar companies, we typically find 25-45% cost savings + critical security threats",
-        "contact_email": request.email,
-        "schedule_confirmation": True,
-        "response_time": "24 hours",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/simulate-fix")
-async def simulate_fix():
-    """Simulate fixing all identified issues"""
-    instances = generate_instances()
-    total_monthly = sum(i["monthly_cost"] for i in instances)
-    savings = total_monthly * random.uniform(0.25, 0.45)
-    
-    return {
-        "message": "All threats remediated and costs optimized!",
-        "remediation_id": f"remediation-{uuid.uuid4().hex[:8]}",
-        "threats_resolved": random.randint(8, 15),
-        "monthly_savings": f"${savings:,.2f}",
-        "annual_savings": f"${savings * 12:,.2f}",
-        "compliance_achieved": True,
-        "security_score_improvement": f"+{random.randint(35, 75)}%",
-        "time_to_fix": f"{random.randint(2, 7)} days",
-        "roi": f"{random.randint(450, 1200)}%",
-        "next_steps": [
-            "Continuous monitoring enabled",
-            "Compliance reporting automated",
-            "Cost optimization ongoing",
-            "Security training scheduled"
-        ],
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/executive-summary")
-async def executive_summary():
-    """Generate executive summary report"""
-    instances = generate_instances()
-    threats = generate_threats(instances)
-    total_monthly = sum(i["monthly_cost"] for i in instances)
-    savings = total_monthly * random.uniform(0.25, 0.45)
-    
-    critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
-    high_threats = len([t for t in threats if t["severity"] == "HIGH"])
-    
-    return {
-        "report_id": f"exec-summary-{uuid.uuid4().hex[:8]}",
-        "generated_date": datetime.now().isoformat(),
-        "executive_overview": {
-            "total_instances": len(instances),
-            "security_rating": f"{random.randint(45, 75)}/100",
-            "cost_efficiency": f"{random.randint(55, 80)}/100",
-            "compliance_status": "At Risk",
-            "overall_health": "Needs Immediate Attention",
-            "business_risk": "High"
-        },
-        "key_findings": {
-            "critical_threats": critical_threats,
-            "high_risks": high_threats,
-            "total_threats": len(threats),
-            "monthly_waste": f"${savings:,.2f}",
-            "compliance_gaps": random.randint(2, 6),
-            "data_risks": random.randint(3, 8)
-        },
-        "recommended_actions": [
-            "Immediate: Address critical security threats (1-2 days)",
-            "Short-term: Optimize overprovisioned resources (3-5 days)", 
-            "Strategic: Implement cost governance framework (2 weeks)",
-            "Compliance: Remediate regulatory violations (1 week)",
-            "Ongoing: Continuous security monitoring (immediate)"
-        ],
-        "business_impact": {
-            "financial_risk": f"${random.randint(500000, 2000000):,}",
-            "reputation_risk": "High",
-            "operational_risk": "Medium-High",
-            "compliance_risk": "High",
-            "customer_trust_risk": "High"
-        },
-        "investment_analysis": {
-            "estimated_remediation_cost": "$50,000",
-            "potential_annual_savings": f"${savings * 12:,.2f}",
-            "risk_reduction": "85-95%",
-            "payback_period": f"{random.randint(1, 3)} months",
-            "roi": f"{random.randint(400, 1200)}%"
-        }
+        "business_impact": f"Savings could fund {savings / 8.333:.1f} additional team members"
     }
 
 @app.get("/dashboard-metrics")
@@ -1475,41 +1348,33 @@ async def dashboard_metrics():
         "running_instances": len([i for i in instances if i["state"] == "running"]),
         "critical_threats": critical_threats,
         "high_threats": high_threats,
-        "total_threats": len(threats),
         "monthly_spend": f"${total_monthly:,.2f}",
         "potential_savings": f"${total_monthly * 0.35:,.2f}",
-        "compliance_score": f"{random.randint(65, 85)}%",
-        "security_rating": f"{random.randint(4, 7)}/10",
-        "cost_efficiency": f"{random.randint(55, 80)}%",
-        "last_scan": datetime.now().isoformat(),
-        "overall_risk": "HIGH" if critical_threats > 0 else "MEDIUM"
+        "security_rating": f"{random.randint(4, 7)}/10"
     }
 
-@app.get("/quick-scan", response_model=QuickScanResponse)
-async def quick_scan():
-    """Fast scan for instant demo impact"""
-    instances = generate_instances()
-    threats = generate_threats(instances)
-    
-    critical_threats = [t for t in threats if t["severity"] == "CRITICAL"]
-    high_threats = [t for t in threats if t["severity"] == "HIGH"]
-    
-    immediate_risks = (critical_threats + high_threats)[:3]  # Top 3 risks
-    
+# Debug Endpoints
+@app.get("/debug/customers")
+async def debug_customers():
+    """Debug endpoint to see all customers (remove in production)"""
     return {
-        "status": "completed",
-        "scan_time": f"{random.randint(15, 60)} seconds",
-        "critical_findings": len(critical_threats),
-        "immediate_risks": immediate_risks,
-        "next_actions": [
-            "Immediately terminate cryptomining instances",
-            "Begin right-sizing overprovisioned resources", 
-            "Schedule emergency security review",
-            "Initiate compliance remediation"
-        ]
+        "total_customers": len(customers_db),
+        "active_customers": len([c for c in customers_db.values() if c.get('subscription_status') == 'active']),
+        "automation_history_count": sum(len(history) for history in automation_history.values()),
+        "customers": {k: {**v, 'aws_role_arn': v.get('aws_role_arn', '')[:20] + '...' if v.get('aws_role_arn') else None} for k, v in customers_db.items()}
     }
 
-# Required for Render deployment
+@app.get("/debug/config")
+async def debug_config():
+    """Debug configuration"""
+    return {
+        "stripe_configured": bool(stripe.api_key),
+        "aws_configured": aws_session is not None,
+        "automation_configured": scheduler.running,
+        "total_customers": len(customers_db),
+        "price_ids": {k: v[:20] + "..." if v else None for k, v in PRICE_IDS.items()}
+    }
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))

@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Spectraine Cloud Security Read-Only Role'
+
+Parameters:
+  SpectraineAccountId:
+    Type: String
+    Default: 'YOUR_SPECTRAINE_AWS_ACCOUNT_ID'
+
+Resources:
+  SpectraineReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SpectraineReadOnlyRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${SpectraineAccountId}:root'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+Outputs:
+  RoleArn:
+    Description: 'Spectraine Read-Only Role ARN'
+    Value: !GetAtt SpectraineReadOnlyRole.Arn
