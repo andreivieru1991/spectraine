@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Form, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import random
@@ -8,16 +9,29 @@ from datetime import datetime, timedelta
 import boto3
 from dotenv import load_dotenv
 import os
+import stripe
 
 # Load environment variables
 load_dotenv()
+
+# Initialize Stripe
+stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
+STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY')
+STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
+
+# Price IDs - REPLACE THESE WITH YOUR ACTUAL STRIPE PRICE IDs
+PRICE_IDS = {
+    "premium_assessment": "$997",  # $997 - Replace with your actual price ID
+    "aws_setup": "$497",           # $497 - Replace with your actual price ID  
+    "health_check": "$1497"         # $1,497 - Replace with your actual price ID
+}
 
 # Initialize AWS session
 try:
     aws_session = boto3.Session(
         aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
         aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        region_name=os.getenv('AWS_DEFAULT_REGION', 'eu-north-1')  # Updated to eu-north-1
+        region_name=os.getenv('AWS_DEFAULT_REGION', 'eu-north-1')
     )
     print("✅ AWS Session initialized successfully")
 except Exception as e:
@@ -27,16 +41,16 @@ except Exception as e:
 app = FastAPI(
     title="Spectraine API",
     description="Cloud Threat Detection & Cost Optimization",
-    version="2.0.0"
+    version="2.1.0"
 )
 
-# FIXED CORS CONFIGURATION - MUST BE BEFORE ROUTES
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Data Models
@@ -138,7 +152,6 @@ def get_instance_name(instance):
 
 def estimate_instance_cost(instance_type):
     """Estimate monthly cost based on instance type"""
-    # Updated with eu-north-1 pricing (approximate)
     pricing = {
         't2.micro': 8.50, 't2.small': 17.00, 't2.medium': 34.00,
         't3.micro': 7.50, 't3.small': 15.00, 't3.medium': 30.00,
@@ -146,7 +159,7 @@ def estimate_instance_cost(instance_type):
         'c5.large': 76.00, 'c5.xlarge': 152.00, 'c5.2xlarge': 304.00,
         'r5.large': 116.00, 'r5.xlarge': 232.00, 'r5.2xlarge': 464.00,
     }
-    return pricing.get(instance_type, 90.00)  # Slightly lower default for EU North
+    return pricing.get(instance_type, 90.00)
 
 def analyze_instance_threats(instance):
     """Analyze real security threats"""
@@ -205,7 +218,6 @@ def generate_instances():
         {"type": "r5d.2xlarge", "cost": 536.00, "typical_use": "memory intensive", "threat_weight": 0.6}
     ]
     
-    # Updated regions with eu-north-1 as primary
     regions = ["eu-north-1", "eu-west-1", "us-east-1", "us-west-2", "ap-southeast-1"]
     environments = ["prod", "staging", "dev", "qa", "uat"]
     
@@ -248,33 +260,26 @@ def generate_instance_threats(template):
     """Generate realistic threats based on instance type and characteristics"""
     threats = []
     
-    # High-cost instances are often overprovisioned
     if template["cost"] > 300 and random.random() > 0.3:
         threats.append("overprovisioned")
     
-    # GPU instances often used for cryptomining
     if template["type"].startswith("g") and random.random() > 0.4:
         threats.append("cryptomining")
     
-    # Databases often have compliance issues
     if template["typical_use"] == "database" and random.random() > 0.5:
         threats.append("compliance_violation")
         threats.append("data_exposure_risk")
     
-    # Development instances often have security issues
     if template["typical_use"] == "development" and random.random() > 0.6:
         threats.append("unencrypted_volumes")
         threats.append("insecure_configuration")
     
-    # Storage optimized instances might have data risks
     if template["typical_use"] == "storage optimized" and random.random() > 0.5:
         threats.append("data_retention_violation")
     
-    # Add some random critical threats
     if random.random() > 0.7:
         threats.append("data_exfiltration_patterns")
     
-    # Ensure at least some instances have threats for demo impact
     if not threats and random.random() > 0.5:
         threats.append("overprovisioned")
     
@@ -449,23 +454,64 @@ def generate_cost_recommendations(instances):
         }
     ]
 
+# STRIPE PAYMENT FUNCTIONS
+async def send_service_confirmation(session):
+    """Send confirmation email"""
+    print(f"🎉 PAYMENT CONFIRMED: {session['customer_email']}")
+    print(f"   Service: {session['metadata']['service_type']}")
+    print(f"   Amount: ${session['amount_total'] / 100}")
+    print(f"   Customer: {session['metadata'].get('customer_name', 'N/A')}")
+    print(f"   Company: {session['metadata'].get('company', 'N/A')}")
+    
+    # TODO: Integrate with your email service (SendGrid, AWS SES, etc.)
+
+async def handle_successful_payment(session):
+    """Handle successful payment and trigger service delivery"""
+    try:
+        print(f"💰 PAYMENT CONFIRMED VIA WEBHOOK:")
+        print(f"   Customer: {session.get('customer_email')}")
+        print(f"   Amount: ${session.get('amount_total', 0) / 100}")
+        print(f"   Service: {session.get('metadata', {}).get('service_type')}")
+        
+        # Send confirmation email
+        await send_service_confirmation(session)
+        
+        # Log the successful payment
+        print(f"✅ Service activated for: {session.get('customer_email')}")
+        
+    except Exception as e:
+        print(f"❌ Error handling successful payment: {e}")
+
 # API Routes
 @app.get("/")
 async def root():
     return {
-        "message": "Spectraine API - Cloud Threat Detection", 
+        "message": "Spectraine API - Cloud Threat Detection & Monetization", 
         "status": "running",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "demo_mode": True,
         "aws_connected": aws_session is not None,
+        "stripe_connected": stripe.api_key is not None,
         "default_region": "eu-north-1",
+        "premium_services": {
+            "premium_assessment": "$997 - Comprehensive security assessment",
+            "aws_setup_service": "$497 - AWS security baseline setup", 
+            "health_check": "$1,497 - Full cloud health check"
+        },
         "endpoints": {
             "/": "API information",
             "/health": "Health check",
             "/instances": "Get EC2 instances with threats",
             "/threat-scan": "Run threat detection scan",
             "/cost-analysis": "Get cost optimization recommendations",
-            "/free-assessment": "Submit assessment request",
+            "/free-assessment": "Submit free assessment request",
+            "/premium-assessment": "Start premium assessment ($997)",
+            "/aws-setup-service": "AWS security setup ($497)",
+            "/health-check-package": "Cloud health check ($1,497)",
+            "/create-checkout-session": "Create Stripe checkout session",
+            "/success": "Payment success page",
+            "/cancel": "Payment cancel page",
+            "/stripe-webhook": "Stripe webhook handler",
             "/dashboard-metrics": "Get real-time dashboard metrics",
             "/quick-scan": "Run instant threat scan",
             "/simulate-fix": "Simulate fixing all issues",
@@ -480,12 +526,239 @@ async def health_check():
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "service": "Spectraine API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "demo_mode": True,
         "aws_connected": aws_session is not None,
+        "stripe_connected": stripe.api_key is not None,
         "default_region": "eu-north-1"
     }
 
+# PAYMENT ENDPOINTS
+@app.post("/create-checkout-session")
+async def create_checkout_session(
+    price_id: str = Form(...),
+    customer_email: str = Form(...),
+    service_type: str = Form(...)
+):
+    """Create a Stripe checkout session"""
+    try:
+        session = stripe.checkout.Session.create(
+            customer_email=customer_email,
+            payment_method_types=['card'],
+            line_items=[{
+                'price': price_id,
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}',
+            cancel_url='https://spectraine1.onrender.com/cancel',
+            metadata={
+                'service_type': service_type,
+                'customer_email': customer_email
+            }
+        )
+        return {"checkout_url": session.url}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/premium-assessment")
+async def premium_assessment(
+    name: str = Form(...),
+    email: str = Form(...),
+    company: str = Form(...),
+    aws_spend: str = Form("unknown"),
+    priority_concerns: List[str] = Form([])
+):
+    """Premium assessment with payment - $997"""
+    print(f"💰 PREMIUM ASSESSMENT REQUEST: {name} from {company}")
+    
+    try:
+        session = stripe.checkout.Session.create(
+            customer_email=email,
+            payment_method_types=['card'],
+            line_items=[{
+                'price': PRICE_IDS["premium_assessment"],
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}&service=premium-assessment',
+            cancel_url='https://spectraine1.onrender.com/cancel',
+            metadata={
+                'service_type': 'premium_assessment',
+                'customer_name': name,
+                'customer_email': email,
+                'company': company,
+                'aws_spend': aws_spend,
+                'priority_concerns': ','.join(priority_concerns)
+            }
+        )
+        
+        return {
+            "message": "Premium assessment checkout created",
+            "checkout_url": session.url,
+            "price": "$997.00",
+            "includes": [
+                "Comprehensive security assessment",
+                "Detailed PDF report", 
+                "30-minute consultation",
+                "Priority remediation roadmap",
+                "3-month cost tracking"
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Payment setup failed: {str(e)}")
+
+@app.post("/aws-setup-service")
+async def aws_setup_service(
+    name: str = Form(...),
+    email: str = Form(...),
+    company: str = Form(...),
+    current_setup: str = Form("unknown")
+):
+    """AWS setup service with payment - $497"""
+    print(f"🔧 AWS SETUP REQUEST: {name} from {company}")
+    
+    try:
+        session = stripe.checkout.Session.create(
+            customer_email=email,
+            payment_method_types=['card'],
+            line_items=[{
+                'price': PRICE_IDS["aws_setup"],
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}&service=aws-setup',
+            cancel_url='https://spectraine1.onrender.com/cancel',
+            metadata={
+                'service_type': 'aws_setup',
+                'customer_name': name,
+                'customer_email': email,
+                'company': company,
+                'current_setup': current_setup
+            }
+        )
+        
+        return {
+            "message": "AWS setup service checkout created",
+            "checkout_url": session.url,
+            "price": "$497.00",
+            "includes": [
+                "Read-only IAM role creation",
+                "Security group hardening",
+                "Cost allocation tags setup",
+                "CloudTrail enablement",
+                "Security baseline configuration"
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Payment setup failed: {str(e)}")
+
+@app.post("/health-check-package")
+async def health_check_package(
+    name: str = Form(...),
+    email: str = Form(...),
+    company: str = Form(...)
+):
+    """Cloud health check package - $1,497"""
+    try:
+        session = stripe.checkout.Session.create(
+            customer_email=email,
+            payment_method_types=['card'],
+            line_items=[{
+                'price': PRICE_IDS["health_check"],
+                'quantity': 1,
+            }],
+            mode='payment',
+            success_url='https://spectraine1.onrender.com/success?session_id={CHECKOUT_SESSION_ID}&service=health-check',
+            cancel_url='https://spectraine1.onrender.com/cancel',
+            metadata={
+                'service_type': 'health_check',
+                'customer_name': name,
+                'customer_email': email,
+                'company': company
+            }
+        )
+        
+        return {
+            "message": "Health check package checkout created",
+            "checkout_url": session.url,
+            "price": "$1,497.00",
+            "includes": [
+                "Full cloud infrastructure health check",
+                "Executive summary report",
+                "1-hour strategy session", 
+                "30-day follow-up support",
+                "ROI calculation and tracking"
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Payment setup failed: {str(e)}")
+
+@app.get("/success")
+async def success(session_id: str, service: str = "unknown"):
+    """Payment success page"""
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+        
+        # Send confirmation
+        await send_service_confirmation(session)
+        
+        return {
+            "message": "Payment successful!",
+            "service": service,
+            "customer_email": session.customer_email,
+            "amount_total": f"${session.amount_total / 100}",
+            "next_steps": [
+                "We'll contact you within 2 hours to schedule your service",
+                "Check your email for confirmation and next steps",
+                "Prepare any AWS access requirements"
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/cancel")
+async def cancel():
+    """Payment cancellation page"""
+    return {
+        "message": "Payment cancelled",
+        "note": "You can try again anytime. No charges were made.",
+        "contact": "If you have questions, contact support@spectraine.com"
+    }
+
+@app.post("/stripe-webhook")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhooks for payment confirmation"""
+    if not STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=400, detail="Webhook secret not configured")
+    
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+    
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError as e:
+        # Invalid payload
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError as e:
+        # Invalid signature
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    # Handle the event
+    if event['type'] == 'checkout.session.completed':
+        session = event['data']['object']
+        await handle_successful_payment(session)
+    elif event['type'] == 'payment_intent.succeeded':
+        payment_intent = event['data']['object']
+        print(f"Payment succeeded: {payment_intent['id']}")
+    else:
+        print(f"Unhandled event type: {event['type']}")
+    
+    return {"status": "success"}
+
+# EXISTING APPLICATION ENDPOINTS
 @app.get("/instances", response_model=List[InstanceResponse])
 async def get_instances(use_real: bool = False):
     """Get EC2 instances with threat analysis"""
