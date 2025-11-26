@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Form, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import random
@@ -613,6 +613,7 @@ async def root():
             "/stripe-test": "Test Stripe configuration",
             "/debug/config": "Debug configuration",
             "/download-cloudformation-template": "Get CloudFormation template for secure AWS connection",
+            "/download-cloudformation-template-file": "Download CloudFormation template file",
             "/customer-onboarding": "Onboard customer with cross-account role",
             "/customer-assessment/{customer_id}": "Run assessment for customer",
             "/customer-scan": "Scan customer AWS account",
@@ -646,30 +647,130 @@ async def health_check():
         "default_region": "eu-north-1"
     }
 
-# CloudFormation Template Download
-@app.get("/download-cloudformation-template")
-async def download_cloudformation_template():
-    """Serve the CloudFormation template to customers"""
+# CloudFormation Template Download - BULLETPROOF VERSION
+@app.get("/download-cloudformation-template-file")
+async def download_cloudformation_template_file():
+    """Bulletproof CloudFormation template download with multiple fallbacks"""
     try:
-        # Read the template file
-        with open('cloudformation/spectraine-role-setup.yml', 'r') as file:
-            template_content = file.read()
+        print("🔧 Attempting to serve CloudFormation template...")
         
-        return {
-            "template": template_content,
-            "filename": "spectraine-role-setup.yml",
-            "instructions": "Deploy this CloudFormation stack in your AWS account and provide the RoleArn output",
-            "spectraine_account_id": SPECTRAINE_ACCOUNT_ID
-        }
-    except FileNotFoundError:
-        # Fallback template if file doesn't exist
+        # Try multiple possible file paths
+        possible_paths = [
+            'cloudformation/spectraine-role-setup.yml',
+            './cloudformation/spectraine-role-setup.yml',
+            'backend/cloudformation/spectraine-role-setup.yml',
+            './backend/cloudformation/spectraine-role-setup.yml'
+        ]
+        
+        file_found = False
+        file_path = None
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                file_found = True
+                file_path = path
+                print(f"✅ Found CloudFormation file at: {path}")
+                break
+        
+        if file_found:
+            # Serve the physical file
+            return FileResponse(
+                file_path,
+                media_type='application/x-yaml',
+                filename='spectraine-role-setup.yml'
+            )
+        else:
+            print("⚠️ No CloudFormation file found, using generated template")
+            raise FileNotFoundError("No CloudFormation file found in any location")
+            
+    except Exception as e:
+        print(f"⚠️ CloudFormation file error: {e}. Using fallback template.")
+        
+        # Generate the template dynamically
         fallback_template = f"""AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Spectraine Cloud Security Read-Only Role'
 
 Parameters:
   SpectraineAccountId:
     Type: String
-    Description: 'Enter your Spectraine AWS Account ID'
+    Description: 'Spectraine AWS Account ID (provided by Spectraine)'
+    Default: '{SPECTRAINE_ACCOUNT_ID}'
+
+Resources:
+  SpectraineReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SpectraineReadOnlyRole
+      Description: 'Read-only role for Spectraine cloud security assessment'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${{SpectraineAccountId}}:root'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSCostExplorerReadOnlyAccess
+
+Outputs:
+  RoleArn:
+    Description: 'Spectraine Read-Only Role ARN - Copy this value to Spectraine'
+    Value: !GetAtt SpectraineReadOnlyRole.Arn
+    Export:
+      Name: !Sub '${{AWS::StackName}}-RoleArn'
+
+  SetupInstructions:
+    Description: 'Next Steps'
+    Value: |
+      1. Deploy this stack in your AWS account
+      2. Copy the RoleArn output value
+      3. Provide the RoleArn to Spectraine
+      4. We will assume this role for read-only security assessment
+"""
+        
+        # Return the generated template
+        return Response(
+            content=fallback_template,
+            media_type='application/x-yaml',
+            headers={
+                'Content-Disposition': 'attachment; filename="spectraine-role-setup.yml"',
+                'Content-Type': 'application/x-yaml'
+            }
+        )
+
+@app.get("/download-cloudformation-template")
+async def download_cloudformation_template():
+    """Serve the CloudFormation template info as JSON"""
+    try:
+        # Try to read the file if it exists
+        possible_paths = [
+            'cloudformation/spectraine-role-setup.yml',
+            './cloudformation/spectraine-role-setup.yml', 
+            'backend/cloudformation/spectraine-role-setup.yml',
+            './backend/cloudformation/spectraine-role-setup.yml'
+        ]
+        
+        template_content = None
+        for path in possible_paths:
+            try:
+                with open(path, 'r') as file:
+                    template_content = file.read()
+                print(f"✅ Serving CloudFormation template from: {path}")
+                break
+            except:
+                continue
+        
+        if template_content is None:
+            # Generate fallback template
+            template_content = f"""AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Spectraine Cloud Security Read-Only Role'
+
+Parameters:
+  SpectraineAccountId:
+    Type: String  
+    Description: 'Spectraine AWS Account ID'
     Default: '{SPECTRAINE_ACCOUNT_ID}'
 
 Resources:
@@ -694,23 +795,20 @@ Outputs:
     Value: !GetAtt SpectraineReadOnlyRole.Arn"""
         
         return {
-            "template": fallback_template,
+            "template": template_content,
             "filename": "spectraine-role-setup.yml",
             "instructions": "Deploy this CloudFormation stack in your AWS account and provide the RoleArn output",
+            "spectraine_account_id": SPECTRAINE_ACCOUNT_ID,
+            "source": "file" if template_content else "generated"
+        }
+        
+    except Exception as e:
+        print(f"❌ Error in template endpoint: {e}")
+        return {
+            "error": "Failed to load template",
+            "instructions": "Please contact support for the CloudFormation template",
             "spectraine_account_id": SPECTRAINE_ACCOUNT_ID
         }
-
-@app.get("/download-cloudformation-template-file")
-async def download_cloudformation_template_file():
-    """Direct file download endpoint"""
-    try:
-        return FileResponse(
-            'cloudformation/spectraine-role-setup.yml',
-            media_type='application/x-yaml',
-            filename='spectraine-role-setup.yml'
-        )
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="CloudFormation template file not found. Please check the file path.")
 
 # Customer Onboarding Endpoints
 @app.post("/customer-onboarding")
@@ -926,7 +1024,7 @@ async def test_form(
         }
     }
 
-# Payment Endpoints (unchanged from previous version)
+# Payment Endpoints
 @app.post("/premium-assessment")
 async def premium_assessment(
     name: str = Form(...),
@@ -1140,7 +1238,7 @@ async def health_check_package(
         print(f"❌ Error in health check package: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
 
-# Existing Application Endpoints (unchanged)
+# Existing Application Endpoints
 @app.get("/instances", response_model=List[InstanceResponse])
 async def get_instances(use_real: bool = False):
     """Get EC2 instances with threat analysis"""
