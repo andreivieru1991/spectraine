@@ -19,13 +19,32 @@ stripe.api_key = os.getenv('STRIPE_SECRET_KEY')
 STRIPE_PUBLISHABLE_KEY = os.getenv('STRIPE_PUBLISHABLE_KEY')
 STRIPE_WEBHOOK_SECRET = os.getenv('STRIPE_WEBHOOK_SECRET')
 
-# Price IDs - REPLACE THESE WITH YOUR ACTUAL STRIPE PRICE IDs
+# Get Price IDs from environment variables with fallbacks
 PRICE_IDS = {
-    "premium_assessment": "$997",  # $997 - Replace with your actual price ID
-    "aws_setup": "$497",           # $497 - Replace with your actual price ID  
-    "health_check": "$1497"         # $1,497 - Replace with your actual price ID
+    "premium_assessment": os.getenv('STRIPE_PREMIUM_ASSESSMENT_PRICE', 'price_1SVsI4Eg6G72wXg4KD2g7Ol3'),
+    "aws_setup": os.getenv('STRIPE_AWS_SETUP_PRICE', 'price_1SVsI4Eg6G72wXg4BG2lzf9y'),
+    "health_check": os.getenv('STRIPE_HEALTH_CHECK_PRICE', 'price_1SVsI4Eg6G72wXg4CI4BCLnF')
 }
 
+# Add this check to verify Stripe is configured
+def check_stripe_config():
+    if not stripe.api_key:
+        print("❌ STRIPE_SECRET_KEY is not set in environment variables")
+        return False
+    
+    if stripe.api_key.startswith('sk_live') or stripe.api_key.startswith('sk_test'):
+        print(f"✅ Stripe configured with key: {stripe.api_key[:20]}...")
+        return True
+    else:
+        print("❌ Invalid Stripe secret key format")
+        return False
+
+# Call this function when your app starts
+print("🔧 Checking Stripe configuration...")
+if not check_stripe_config():
+    print("🚨 Stripe is not properly configured. Payment features will not work.")
+else:
+    print("✅ Stripe configuration is valid!")
 # Initialize AWS session
 try:
     aws_session = boto3.Session(
@@ -1037,4 +1056,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
 
     uvicorn.run(app, host="0.0.0.0", port=port)
-
