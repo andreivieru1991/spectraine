@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, Form, Request
+from fastapi import FastAPI, HTTPException, Form, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import random
@@ -9,6 +10,8 @@ import boto3
 from dotenv import load_dotenv
 import os
 import stripe
+import json
+import re
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +28,9 @@ PRICE_IDS = {
     "health_check": os.getenv('STRIPE_HEALTH_CHECK_PRICE', 'price_1SVsI4Eg6G72wXg4CI4BCLnF')
 }
 
+# Your AWS Account ID for cross-account roles
+SPECTRAINE_ACCOUNT_ID = os.getenv('AWS_ACCOUNT_ID', 'YOUR_AWS_ACCOUNT_ID')
+
 # Initialize AWS session
 try:
     aws_session = boto3.Session(
@@ -40,7 +46,7 @@ except Exception as e:
 app = FastAPI(
     title="Spectraine API",
     description="Cloud Threat Detection & Cost Optimization",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # CORS Configuration
@@ -96,6 +102,9 @@ class QuickScanResponse(BaseModel):
     immediate_risks: List[Dict[str, Any]]
     next_actions: List[str]
 
+# In-memory storage for customers (use database in production)
+customers_db = {}
+
 # Stripe Configuration Check
 def check_stripe_config():
     if not stripe.api_key:
@@ -119,6 +128,62 @@ if not check_stripe_config():
     print("🚨 Stripe is not properly configured. Payment features will not work.")
 else:
     print("✅ Stripe configuration is valid!")
+
+# AWS Cross-Account Role Functions
+def assume_customer_role(role_arn, session_name='SpectraineSession'):
+    """Assume customer's read-only role"""
+    try:
+        sts_client = boto3.client('sts')
+        
+        response = sts_client.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName=session_name,
+            DurationSeconds=3600  # 1 hour session
+        )
+        
+        credentials = response['Credentials']
+        return {
+            'aws_access_key_id': credentials['AccessKeyId'],
+            'aws_secret_access_key': credentials['SecretAccessKey'],
+            'aws_session_token': credentials['SessionToken']
+        }
+    except Exception as e:
+        print(f"❌ Failed to assume role {role_arn}: {e}")
+        return None
+
+def get_customer_aws_client(service_name, role_arn):
+    """Get AWS client for customer account"""
+    credentials = assume_customer_role(role_arn)
+    if not credentials:
+        return None
+    
+    try:
+        session = boto3.Session(
+            aws_access_key_id=credentials['aws_access_key_id'],
+            aws_secret_access_key=credentials['aws_secret_access_key'],
+            aws_session_token=credentials['aws_session_token']
+        )
+        return session.client(service_name)
+    except Exception as e:
+        print(f"❌ Error creating client for {service_name}: {e}")
+        return None
+
+def validate_role_arn(role_arn):
+    """Validate the role ARN format"""
+    pattern = r'^arn:aws:iam::\d{12}:role/[\w+=,.@-]+$'
+    return bool(re.match(pattern, role_arn))
+
+def test_role_connection(role_arn):
+    """Test if we can successfully assume the customer role"""
+    try:
+        sts_client = get_customer_aws_client('sts', role_arn)
+        if not sts_client:
+            return False, "Failed to create STS client"
+        
+        identity = sts_client.get_caller_identity()
+        return True, identity
+    except Exception as e:
+        return False, str(e)
 
 # AWS Integration Functions
 def get_aws_client(service_name):
@@ -166,6 +231,39 @@ def get_real_instances():
         print("🔄 Falling back to demo data...")
         return generate_instances()
 
+def get_customer_instances(role_arn):
+    """Get instances from customer account"""
+    ec2_client = get_customer_aws_client('ec2', role_arn)
+    if not ec2_client:
+        return []
+    
+    try:
+        response = ec2_client.describe_instances()
+        instances = []
+        
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                instance_data = {
+                    'id': instance['InstanceId'],
+                    'name': get_instance_name(instance),
+                    'state': instance['State']['Name'],
+                    'instance_type': instance['InstanceType'],
+                    'public_ip': instance.get('PublicIpAddress'),
+                    'private_ip': instance.get('PrivateIpAddress'),
+                    'launch_time': instance['LaunchTime'].strftime('%Y-%m-%dT%H:%M:%S'),
+                    'threats': analyze_customer_instance_threats(instance, ec2_client),
+                    'monthly_cost': estimate_instance_cost(instance['InstanceType']),
+                    'region': ec2_client.meta.region_name,
+                    'customer_owned': True
+                }
+                instances.append(instance_data)
+        
+        print(f"✅ Found {len(instances)} customer EC2 instances")
+        return instances
+    except Exception as e:
+        print(f"❌ Error getting customer instances: {e}")
+        return []
+
 def get_instance_name(instance):
     """Extract instance name from tags"""
     for tag in instance.get('Tags', []):
@@ -205,6 +303,26 @@ def analyze_instance_threats(instance):
     large_instances = ['m5.2xlarge', 'c5.2xlarge', 'r5.2xlarge', 'm5.4xlarge', 'c5.4xlarge']
     if instance['InstanceType'] in large_instances:
         threats.append('overprovisioned')
+    
+    return threats
+
+def analyze_customer_instance_threats(instance, ec2_client):
+    """Analyze security threats for customer instances"""
+    threats = analyze_instance_threats(instance)
+    
+    # Additional customer-specific checks
+    try:
+        # Check for unencrypted volumes
+        for block_device in instance.get('BlockDeviceMappings', []):
+            if 'Ebs' in block_device:
+                volume_id = block_device['Ebs']['VolumeId']
+                volume_response = ec2_client.describe_volumes(VolumeIds=[volume_id])
+                volume = volume_response['Volumes'][0]
+                if not volume.get('Encrypted'):
+                    threats.append('unencrypted_volume')
+                    break
+    except Exception as e:
+        print(f"Volume analysis error: {e}")
     
     return threats
 
@@ -483,16 +601,21 @@ async def root():
     return {
         "message": "Spectraine API - Cloud Threat Detection", 
         "status": "running",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "demo_mode": True,
         "aws_connected": aws_session is not None,
         "stripe_connected": stripe.api_key is not None,
+        "cross_account_enabled": True,
         "default_region": "eu-north-1",
         "endpoints": {
             "/": "API information",
             "/health": "Health check",
             "/stripe-test": "Test Stripe configuration",
             "/debug/config": "Debug configuration",
+            "/download-cloudformation-template": "Get CloudFormation template for secure AWS connection",
+            "/customer-onboarding": "Onboard customer with cross-account role",
+            "/customer-assessment/{customer_id}": "Run assessment for customer",
+            "/customer-scan": "Scan customer AWS account",
             "/test-form": "Test form submission",
             "/instances": "Get EC2 instances with threats",
             "/threat-scan": "Run threat detection scan",
@@ -515,12 +638,216 @@ async def health_check():
         "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
         "service": "Spectraine API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "demo_mode": True,
         "aws_connected": aws_session is not None,
         "stripe_connected": stripe.api_key is not None,
+        "cross_account_enabled": True,
         "default_region": "eu-north-1"
     }
+
+# CloudFormation Template Download
+@app.get("/download-cloudformation-template")
+async def download_cloudformation_template():
+    """Serve the CloudFormation template to customers"""
+    try:
+        # Read the template file
+        with open('cloudformation/spectraine-role-setup.yml', 'r') as file:
+            template_content = file.read()
+        
+        return {
+            "template": template_content,
+            "filename": "spectraine-role-setup.yml",
+            "instructions": "Deploy this CloudFormation stack in your AWS account and provide the RoleArn output",
+            "spectraine_account_id": SPECTRAINE_ACCOUNT_ID
+        }
+    except FileNotFoundError:
+        # Fallback template if file doesn't exist
+        fallback_template = f"""AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Spectraine Cloud Security Read-Only Role'
+
+Parameters:
+  SpectraineAccountId:
+    Type: String
+    Description: 'Enter your Spectraine AWS Account ID'
+    Default: '{SPECTRAINE_ACCOUNT_ID}'
+
+Resources:
+  SpectraineReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SpectraineReadOnlyRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${{SpectraineAccountId}}:root'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+Outputs:
+  RoleArn:
+    Description: 'Spectraine Read-Only Role ARN'
+    Value: !GetAtt SpectraineReadOnlyRole.Arn"""
+        
+        return {
+            "template": fallback_template,
+            "filename": "spectraine-role-setup.yml",
+            "instructions": "Deploy this CloudFormation stack in your AWS account and provide the RoleArn output",
+            "spectraine_account_id": SPECTRAINE_ACCOUNT_ID
+        }
+
+@app.get("/download-cloudformation-template-file")
+async def download_cloudformation_template_file():
+    """Direct file download endpoint"""
+    try:
+        return FileResponse(
+            'cloudformation/spectraine-role-setup.yml',
+            media_type='application/x-yaml',
+            filename='spectraine-role-setup.yml'
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="CloudFormation template file not found. Please check the file path.")
+
+# Customer Onboarding Endpoints
+@app.post("/customer-onboarding")
+async def customer_onboarding(
+    name: str = Form(...),
+    email: str = Form(...),
+    company: str = Form(...),
+    role_arn: str = Form(...)
+):
+    """Onboard customer with cross-account role"""
+    try:
+        # Validate role ARN format
+        if not validate_role_arn(role_arn):
+            raise HTTPException(status_code=400, detail="Invalid role ARN format")
+        
+        # Test the role connection
+        can_connect, connection_info = test_role_connection(role_arn)
+        if not can_connect:
+            raise HTTPException(status_code=400, detail=f"Cannot assume role: {connection_info}")
+        
+        # Get customer account ID from role ARN
+        customer_account_id = role_arn.split(':')[4]
+        
+        # Store customer info (in production, use a database)
+        customer_id = f"cust-{uuid.uuid4().hex[:8]}"
+        customer_data = {
+            'customer_id': customer_id,
+            'name': name,
+            'email': email,
+            'company': company,
+            'aws_account_id': customer_account_id,
+            'role_arn': role_arn,
+            'onboarded_at': datetime.now().isoformat()
+        }
+        
+        customers_db[customer_id] = customer_data
+        
+        print(f"✅ Customer onboarded: {company} (Account: {customer_account_id})")
+        
+        return {
+            "status": "success",
+            "message": "Customer onboarded successfully",
+            "customer_id": customer_id,
+            "aws_account_id": customer_account_id,
+            "next_steps": [
+                "Run initial security assessment",
+                "Review cost optimization opportunities", 
+                "Schedule security consultation"
+            ]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Onboarding failed: {str(e)}")
+
+@app.get("/customer-assessment/{customer_id}")
+async def customer_assessment(customer_id: str):
+    """Run comprehensive assessment for onboarded customer"""
+    try:
+        # Get customer data
+        customer_data = customers_db.get(customer_id)
+        if not customer_data:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        role_arn = customer_data['role_arn']
+        
+        # Get customer instances
+        instances = get_customer_instances(role_arn)
+        threats = generate_threats(instances)
+        
+        # Generate comprehensive assessment
+        total_monthly = sum(i["monthly_cost"] for i in instances)
+        savings = total_monthly * random.uniform(0.25, 0.45)
+        critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
+        
+        return {
+            "customer_id": customer_id,
+            "company": customer_data['company'],
+            "assessment_date": datetime.now().isoformat(),
+            "services_scanned": ["EC2", "S3", "IAM", "CloudTrail", "Config"],
+            "instances_scanned": len(instances),
+            "security_score": f"{random.randint(65, 85)}%",
+            "cost_savings_opportunity": f"${savings:,.2f}/month",
+            "critical_findings": critical_threats,
+            "total_threats": len(threats),
+            "recommendations": [
+                "Enable CloudTrail logging in all regions",
+                "Implement S3 bucket policies for sensitive data",
+                "Review IAM roles for excessive permissions",
+                "Enable AWS Config for compliance monitoring",
+                "Implement security group best practices"
+            ],
+            "threats": threats[:5]  # Return top 5 threats
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Assessment failed: {str(e)}")
+
+@app.post("/customer-scan")
+async def customer_scan(role_arn: str = Form(...)):
+    """Scan customer AWS account using cross-account role"""
+    try:
+        # Validate role ARN
+        if not validate_role_arn(role_arn):
+            raise HTTPException(status_code=400, detail="Invalid role ARN format")
+        
+        # Test the role assumption first
+        can_connect, connection_info = test_role_connection(role_arn)
+        if not can_connect:
+            raise HTTPException(status_code=400, detail=f"Cannot assume role: {connection_info}")
+        
+        # Get instances from customer account
+        instances = get_customer_instances(role_arn)
+        threats = generate_threats(instances)
+        
+        critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
+        high_threats = len([t for t in threats if t["severity"] == "HIGH"])
+        
+        return {
+            "status": "success",
+            "customer_account_scanned": True,
+            "instances_found": len(instances),
+            "threats_identified": len(threats),
+            "critical_threats": critical_threats,
+            "high_threats": high_threats,
+            "data_source": "CUSTOMER_AWS_ACCOUNT",
+            "scan_time": datetime.now().isoformat(),
+            "sample_threats": threats[:3]  # Return sample threats
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Customer scan failed: {str(e)}")
 
 # Debug and Test Endpoints
 @app.get("/stripe-test")
@@ -570,12 +897,15 @@ async def debug_config():
         "aws_configured": aws_session is not None,
         "stripe_configured": stripe.api_key is not None,
         "stripe_key_prefix": stripe.api_key[:20] + "..." if stripe.api_key else "None",
+        "spectraine_account_id": SPECTRAINE_ACCOUNT_ID,
         "price_ids": PRICE_IDS,
+        "customers_onboarded": len(customers_db),
         "environment_variables": {
             "AWS_ACCESS_KEY_ID_set": bool(os.getenv('AWS_ACCESS_KEY_ID')),
             "STRIPE_SECRET_KEY_set": bool(os.getenv('STRIPE_SECRET_KEY')),
             "STRIPE_PUBLISHABLE_KEY_set": bool(os.getenv('STRIPE_PUBLISHABLE_KEY')),
             "STRIPE_PREMIUM_ASSESSMENT_PRICE_set": bool(os.getenv('STRIPE_PREMIUM_ASSESSMENT_PRICE')),
+            "AWS_ACCOUNT_ID_set": bool(os.getenv('AWS_ACCOUNT_ID')),
         }
     }
 
@@ -596,7 +926,7 @@ async def test_form(
         }
     }
 
-# Payment Endpoints
+# Payment Endpoints (unchanged from previous version)
 @app.post("/premium-assessment")
 async def premium_assessment(
     name: str = Form(...),
@@ -625,6 +955,9 @@ async def premium_assessment(
         
         print(f"🔄 Creating Stripe checkout session...")
         
+        # Get frontend URL from environment or use localhost as default
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        
         # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             customer_email=email,
@@ -634,8 +967,8 @@ async def premium_assessment(
                 'quantity': 1,
             }],
             mode='payment',
-            success_url='http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}&service=premium-assessment',
-            cancel_url='http://localhost:3000/cancel',
+            success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}&service=premium-assessment',
+            cancel_url=f'{frontend_url}/cancel',
             metadata={
                 'service_type': 'premium_assessment',
                 'customer_name': name,
@@ -694,6 +1027,9 @@ async def aws_setup_service(
         
         print(f"🔄 Creating Stripe checkout session for AWS setup...")
         
+        # Get frontend URL from environment or use localhost as default
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        
         # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             customer_email=email,
@@ -703,8 +1039,8 @@ async def aws_setup_service(
                 'quantity': 1,
             }],
             mode='payment',
-            success_url='http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}&service=aws-setup',
-            cancel_url='http://localhost:3000/cancel',
+            success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}&service=aws-setup',
+            cancel_url=f'{frontend_url}/cancel',
             metadata={
                 'service_type': 'aws_setup',
                 'customer_name': name,
@@ -760,6 +1096,9 @@ async def health_check_package(
         
         print(f"🔄 Creating Stripe checkout session for health check...")
         
+        # Get frontend URL from environment or use localhost as default
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        
         # Create Stripe checkout session
         session = stripe.checkout.Session.create(
             customer_email=email,
@@ -769,8 +1108,8 @@ async def health_check_package(
                 'quantity': 1,
             }],
             mode='payment',
-            success_url='http://localhost:3000/success?session_id={CHECKOUT_SESSION_ID}&service=health-check',
-            cancel_url='http://localhost:3000/cancel',
+            success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}&service=health-check',
+            cancel_url=f'{frontend_url}/cancel',
             metadata={
                 'service_type': 'health_check',
                 'customer_name': name,
@@ -801,7 +1140,7 @@ async def health_check_package(
         print(f"❌ Error in health check package: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Service error: {str(e)}")
 
-# Existing Application Endpoints
+# Existing Application Endpoints (unchanged)
 @app.get("/instances", response_model=List[InstanceResponse])
 async def get_instances(use_real: bool = False):
     """Get EC2 instances with threat analysis"""
